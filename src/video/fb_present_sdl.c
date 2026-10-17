@@ -1481,6 +1481,12 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         nvk_set_lost_handler(gfx_lost_handler);
     }
 #endif
+/* Mouse cursor idle/visibility tracking state */
+    Uint32 last_mouse_activity = 0;
+    const Uint32 mouse_idle_timeout_ms = 2500; /* Some apos 2.5 segundos parado */
+    int cursor_visible = 0;
+    int prev_overlay_open = 0;
+    SDL_ShowCursor(SDL_DISABLE);
     while (!quit && !guest_done) {
         if (__atomic_load_n(&s_gfx_lost, __ATOMIC_ACQUIRE) == 1) {
             __atomic_store_n(&s_gfx_lost, 2, __ATOMIC_RELEASE);
@@ -1513,6 +1519,36 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                 xbox_InputSdlEvent(&ev);
                 /* Controllers come and go, and take a port, here. */
                 xbox_InputPadEvent(&ev);
+                /* Show cursor on intentional mouse movement/click; hide immediately on controller/key input */
+                if (ev.type == SDL_MOUSEMOTION) {
+                    if (ev.motion.xrel != 0 || ev.motion.yrel != 0) {
+                        last_mouse_activity = SDL_GetTicks();
+                        if (!cursor_visible) {
+                            SDL_ShowCursor(SDL_ENABLE);
+                            cursor_visible = 1;
+                        }
+                    }
+                } else if (ev.type == SDL_MOUSEBUTTONDOWN) {
+                    last_mouse_activity = SDL_GetTicks();
+                    if (!cursor_visible) {
+                        SDL_ShowCursor(SDL_ENABLE);
+                        cursor_visible = 1;
+                    }
+                } else if (ev.type == SDL_KEYDOWN ||
+                           ev.type == SDL_CONTROLLERBUTTONDOWN ||
+                           ev.type == SDL_JOYBUTTONDOWN) {
+                    if (cursor_visible) {
+                        SDL_ShowCursor(SDL_DISABLE);
+                        cursor_visible = 0;
+                    }
+                } else if (ev.type == SDL_CONTROLLERAXISMOTION) {
+                    if (ev.caxis.value > 8000 || ev.caxis.value < -8000) {
+                        if (cursor_visible) {
+                            SDL_ShowCursor(SDL_DISABLE);
+                            cursor_visible = 0;
+                        }
+                    }
+                }
                 if (ev.type == SDL_QUIT)
                     quit = 1;
                 else if (ev.type == s_guest_done_event)
@@ -1525,11 +1561,23 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                     dirty = 1;
             } while (SDL_PollEvent(&ev));
         }
-
+        /* Hide cursor when outside overlay if idle timeout elapsed or state desynchronized */
+        if (!s_overlay_open && SDL_ShowCursor(SDL_QUERY) == SDL_ENABLE) {
+            if (!cursor_visible || (SDL_GetTicks() - last_mouse_activity >= mouse_idle_timeout_ms)) {
+                SDL_ShowCursor(SDL_DISABLE);
+                cursor_visible = 0;
+            }
+        }
 #if defined(XBOXRECOMP_HAVE_OVERLAY)
         /* An open overlay is redrawn on every turn (it animates, and the
          * title behind it is paused, so no frame would wake the loop). */
         s_overlay_open = s_layer && xbox_OverlayOpen();
+        if (prev_overlay_open && !s_overlay_open) {
+            /* Overlay just closed: hide the cursor immediately on gameplay resume */
+            SDL_ShowCursor(SDL_DISABLE);
+            cursor_visible = 0;
+        }
+        prev_overlay_open = s_overlay_open;
         s_overlay_note = s_layer && xbox_OverlayNotice();
         dirty |= s_overlay_open || s_overlay_note;
         /* The title is paused behind an open overlay, so no new frame comes
