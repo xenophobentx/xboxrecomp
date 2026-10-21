@@ -273,12 +273,69 @@ static int emit_ilu_op(StrBuf *sb, const NV2AVshInstruction *inst)
     return 1;
 }
 
+/* D3D8_GLSL_STEREO: does the instruction read the viewport constants
+ * (c[58]/c[59], directly) or take rcc of oPos.w? The first that does starts
+ * the program's conversion of its clip-space position to screen space. */
+static int reads_const(const NV2AVshSrcOperand *s, int lo, int hi)
+{
+    return s->reg_type == NV2A_VSH_REG_CONST && !s->rel_addr && s->reg_index >= lo
+           && s->reg_index <= hi;
+}
+
+static int starts_viewport_conversion(const NV2AVshInstruction *inst)
+{
+    int a = 0, b = 0, c = 0;
+    switch (inst->mac_op) {
+    case NV2A_VSH_MAC_NOP: break;
+    case NV2A_VSH_MAC_MOV: case NV2A_VSH_MAC_ARL: a = 1; break;
+    case NV2A_VSH_MAC_ADD: a = c = 1; break;
+    case NV2A_VSH_MAC_MAD: a = b = c = 1; break;
+    default: a = b = 1; break;
+    }
+    if ((a && reads_const(&inst->mac_src[0], 58, 59)) || (b && reads_const(&inst->mac_src[1], 58, 59))
+            || (c && reads_const(&inst->mac_src[2], 58, 59)))
+        return 1;
+    if (inst->ilu_op != NV2A_VSH_ILU_NOP && reads_const(&inst->ilu_src, 58, 59))
+        return 1;
+    return inst->ilu_op == NV2A_VSH_ILU_RCC && inst->ilu_src.reg_type == NV2A_VSH_REG_TEMP
+           && inst->ilu_src.reg_index == 12 && inst->ilu_src.swizzle.x == 3;
+}
+
+void d3d8_vsh_stereo_info(const NV2AVshProgram *program, D3D8VshStereo *out)
+{
+    int i;
+    out->capture = 0;
+    for (i = 0; i < 4; i++)
+        out->rows[i] = -1;
+    for (i = 0; i < program->length; i++) {
+        const NV2AVshInstruction *inst = &program->insns[i];
+        const NV2AVshDstOperand *d = &inst->mac_dst;
+        int mask = 0, k;
+        if (!out->capture && starts_viewport_conversion(inst))
+            out->capture = 1;
+        if (inst->mac_op != NV2A_VSH_MAC_DP4 && inst->mac_op != NV2A_VSH_MAC_DPH)
+            continue;
+        if (d->temp_reg == 12)
+            mask = d->write_mask;
+        else if (d->output_reg == NV2A_VSH_OUT_POS)
+            mask = d->out_mask;
+        if (mask != 8 && mask != 4 && mask != 2 && mask != 1)
+            continue;
+        k = mask == 8 ? 0 : mask == 4 ? 1 : mask == 2 ? 2 : 3;
+        if (reads_const(&inst->mac_src[1], 0, 191))
+            out->rows[k] = inst->mac_src[1].reg_index;
+        else if (reads_const(&inst->mac_src[0], 0, 191))
+            out->rows[k] = inst->mac_src[0].reg_index;
+    }
+}
+
 int d3d8_vsh_generate_glsl(const NV2AVshProgram *program, unsigned flags,
                            char *buf, int bufsize)
 {
     StrBuf sb;
     int i, k;
     uint16_t inputs = program->inputs_read;
+    int stereo = (flags & D3D8_GLSL_STEREO) && (flags & D3D8_GLSL_SCREEN_SPACE), captured = 0;
 
     sb_init(&sb, buf, bufsize);
     sb_append(&sb,
@@ -288,6 +345,8 @@ int d3d8_vsh_generate_glsl(const NV2AVshProgram *program, unsigned flags,
         D3D8_GLSL_VPCONSTS
         D3D8_GLSL_VS_OUT
         D3D8_GLSL_SATURATE, NV2A_VS_MAX_CONSTANTS);
+    if (stereo)
+        sb_append(&sb, D3D8_GLSL_EYE);
     for (i = 0, k = 0; i < NV2A_VS_MAX_INPUTS; i++)
         if (inputs & (1u << i))
             sb_append(&sb, "layout(location = %d) in vec4 v%d;\n", k++, i);
@@ -309,6 +368,8 @@ int d3d8_vsh_generate_glsl(const NV2AVshProgram *program, unsigned flags,
         "    vec4 oT2  = vec4(0,0,0,1);\n"
         "    vec4 oT3  = vec4(0,0,0,1);\n"
         "#define R12 oPos\n");
+    if (stereo)
+        sb_append(&sb, "    vec4 clipC = vec4(0.0); bool clipOk = false;\n");
     sb_append(&sb, "    /* --- Program body (%d instructions) --- */\n", program->length);
     for (i = 0; i < program->length; i++) {
         const NV2AVshInstruction *inst = &program->insns[i];
@@ -316,6 +377,11 @@ int d3d8_vsh_generate_glsl(const NV2AVshProgram *program, unsigned flags,
         sb_append(&sb, "    { /* Instruction %d */\n", i);
         m = emit_mac_op(&sb, inst);
         u = emit_ilu_op(&sb, inst);
+        /* The units have read their sources; nothing is written yet. */
+        if (stereo && !captured && starts_viewport_conversion(inst)) {
+            sb_append(&sb, "        clipC = oPos; clipOk = true;\n");
+            captured = 1;
+        }
         if (m)
             emit_dest_assign(&sb, &inst->mac_dst, "mac");
         if (u)
@@ -339,7 +405,32 @@ int d3d8_vsh_generate_glsl(const NV2AVshProgram *program, unsigned flags,
              * on Metal and D3D11. (xemu clamps depth instead,
              * hw/xbox/nv2a/pgraph/vk/draw.c depthClampEnable.) */
             "    if (pz > pw && pz <= pw * 1.000001) pz = pw;\n"
-            "    gl_Position = vec4((oPos.xy * vp.vp_scale.xy + vp.vp_off.xy) * pw, pz, pw);\n"
+            "    gl_Position = vec4((oPos.xy * vp.vp_scale.xy + vp.vp_off.xy) * pw, pz, pw);\n");
+        if (stereo && captured)
+            /* An eye: the kept clip position through eye.m, then through the
+             * same mapping to the target as the flat output, when the
+             * program's screen x and y are that position's (its standard
+             * conversion); the program's own depth change kept as a
+             * difference. Else the flat output stands. */
+            sb_append(&sb,
+            "    if (eye.mode.x != 0u && clipOk && clipC.w == oPos.w) {\n"
+            "        float rw = clipC.w == 0.0 ? 1.0 : 1.0 / clipC.w;\n"
+            "        vec2 expect = clipC.xy * c[58].xy * rw + c[59].xy;\n"
+            "        if (all(lessThanEqual(abs(expect - oPos.xy), vec2(0.01) + 0.0001 * abs(oPos.xy)))) {\n"
+            "            vec4 E = eye.m * clipC;\n"
+            "            vec2 A = c[58].xy * vp.vp_scale.xy;\n"
+            "            vec2 B = c[59].xy * vp.vp_scale.xy + vp.vp_off.xy;\n"
+            "            float dz = (oPos.z * vp.vp_scale.z + vp.vp_scale.w) - clipC.z * rw;\n"
+            "            float ez = E.z + dz * E.w;\n"
+            "            if (ez > E.w && ez <= E.w * 1.000001) ez = E.w;\n"
+            "            gl_Position = vec4(E.xy * A + B * E.w, ez, E.w);\n"
+            "        }\n"
+            "    }\n");
+        if (stereo)
+            sb_append(&sb, D3D8_GLSL_EYE_REPROJECT("oPos.xy * vp.vp_scale.xy + vp.vp_off.xy",
+                                                   "oPos.z * vp.vp_scale.z + vp.vp_scale.w",
+                                                   "vp.vp_scale.xy", "vp.vp_off.xy"));
+        sb_append(&sb,
             "    {\n"
             "        float fd = oFog.x, ff = 1.0;\n"
             "        if (vp.fog_ctl.x != 0u) {\n"

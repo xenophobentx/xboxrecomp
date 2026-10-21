@@ -598,6 +598,12 @@ void guest_turn_counts(uint64_t *handoffs, uint64_t *kicks);
  * has waited for the guest CPU since this was last asked. */
 long guest_turn_longest_wait_ms(void);
 
+#if defined(__linux__) && !defined(__ANDROID__)
+/* The rank-th fastest core (0 fastest) the process may use, or -1 when the
+ * host's cores are all alike (win32_compat.c). */
+int recomp_host_cpu_rank(int rank);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

@@ -85,6 +85,10 @@ else()
             ${CMAKE_CURRENT_SOURCE_DIR}/../kernel ${CMAKE_CURRENT_SOURCE_DIR}/..)
         target_link_libraries(xbox_d3d8 PUBLIC Vulkan::Vulkan glslang::glslang
                               glslang::glslang-default-resource-limits)
+        if(XBOXRECOMP_HAVE_VK_XR)
+            target_sources(xbox_d3d8 PRIVATE nv2a_vk_xr.c)
+            target_link_libraries(xbox_d3d8 PUBLIC OpenXR::openxr_loader xbox_input m pthread)
+        endif()
         if(ANDROID)
             # Android: every Vulkan call goes through pointers filled from the
             # loader android_vk.c opens (the system's, or a replacement driver

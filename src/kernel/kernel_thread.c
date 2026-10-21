@@ -572,6 +572,19 @@ DWORD_PTR xbox_GuestCpuMask(void)
             return (DWORD_PTR)1 << fast;
     }
 #endif
+#if defined(__linux__) && !defined(__ANDROID__)
+    /* On a Linux host with cores of different kinds (the Steam Frame: two
+     * little, five big, one prime) the lowest is a little core, and the
+     * title's frames ran late on it (16-28% of flips in a race, against
+     * 0-6 per 600 on a big core). The executor takes the fastest core
+     * (kernel_bridge.c), the guest the next fastest. A host whose cores are
+     * all alike keeps the lowest. */
+    {
+        int next = recomp_host_cpu_rank(1);
+        if (next >= 0 && next < (int)(8 * sizeof proc) && (proc & ((DWORD_PTR)1 << next)))
+            return (DWORD_PTR)1 << next;
+    }
+#endif
     /* The lowest core the process may use: fixed, so every thread lands
      * on the same one whatever core it was created from. */
     return proc & (DWORD_PTR)(-(intptr_t)proc);

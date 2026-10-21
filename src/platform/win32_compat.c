@@ -1092,6 +1092,65 @@ BOOL ReleaseMutex(HANDLE h)
 /* Threads                                                               */
 /* ===================================================================== */
 
+#if defined(__linux__) && !defined(__ANDROID__)
+/* The rank-th fastest core the process may use (0: the fastest), or -1 when
+ * there is none or the host's cores are all alike (the Steam Deck, most
+ * desktop PCs: nothing to choose). Speed is the scheduler's cpu_capacity,
+ * which counts the cores' differing designs, else cpufreq's
+ * cpuinfo_max_freq: on the Steam Frame's Snapdragon the prime core has the
+ * highest capacity (1024) but not the highest clock (its big cores list
+ * 3.15 GHz against 3.05). Ties go to the highest-numbered core. On the Frame:
+ * cpu7 (the prime core), then cpu4 (a big core); on a desktop with
+ * performance and efficiency cores, two performance cores. */
+int recomp_host_cpu_rank(int rank)
+{
+    cpu_set_t set;
+    long speed[64];
+    int i, r, best = -1, known = 0, alike = 1;
+    const char *what[2] = { "cpu_capacity", "cpufreq/cpuinfo_max_freq" };
+    int w;
+
+    if (rank < 0 || sched_getaffinity(0, sizeof set, &set) != 0)
+        return -1;
+    for (w = 0; w < 2 && !known; w++)
+        for (i = 0; i < 64; i++) {
+            char path[96];
+            FILE *f;
+            speed[i] = -1;
+            if (i >= CPU_SETSIZE || !CPU_ISSET(i, &set))
+                continue;
+            snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/%s", i, what[w]);
+            if (!(f = fopen(path, "r")))
+                continue;
+            if (fscanf(f, "%ld", &speed[i]) != 1)
+                speed[i] = -1;
+            fclose(f);
+            if (speed[i] >= 0)
+                known++;
+        }
+    if (!known)
+        return -1;
+    for (i = 0; i < 64; i++)
+        if (speed[i] >= 0 && best >= 0 && speed[i] != speed[best])
+            alike = 0;
+        else if (speed[i] >= 0)
+            best = i;
+    if (alike)
+        return -1;
+    for (r = 0; r <= rank; r++) {
+        best = -1;
+        for (i = 0; i < 64; i++)
+            if (speed[i] >= 0 && (best < 0 || speed[i] >= speed[best]))
+                best = i;
+        if (best < 0)
+            return -1;
+        if (r < rank)
+            speed[best] = -1;   /* taken */
+    }
+    return best;
+}
+#endif
+
 /* Win32 gives a new thread the process's CPU mask; pthread_create copies
  * the creator's. A guest thread pinned to one core (xbox_GuestThreadPin)
  * would otherwise hand that core to every host thread it creates, the

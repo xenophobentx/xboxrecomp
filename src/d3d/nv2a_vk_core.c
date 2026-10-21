@@ -11,6 +11,9 @@
  * normalised float depth the CPU rasteriser keeps.
  */
 #include "nv2a_vk_core.h"
+#if defined(XBOXRECOMP_VK_XR)
+#include "nv2a_vk_xr.h"
+#endif
 
 #include <pthread.h>
 #include <stdio.h>
@@ -142,6 +145,12 @@ static int make_instance(const char *const *inst_exts, unsigned n)
     ci.ppEnabledExtensionNames = exts;
     ci.enabledLayerCount = nl;
     ci.ppEnabledLayerNames = layers;
+#if defined(XBOXRECOMP_VK_XR)
+    /* RECOMP_XR=1: the OpenXR runtime makes it, with what the headset needs. */
+    if (nvkxr_prepare())
+        r = nvkxr_create_instance(&ci, &s_core.inst);
+    else
+#endif
     r = vkCreateInstance(&ci, NULL, &s_core.inst);
     if (r != VK_SUCCESS)
         return fail("vkCreateInstance failed%s: %s", "", r);
@@ -213,6 +222,17 @@ static int make_device(void)
             best_q = q;
         }
     }
+#if defined(XBOXRECOMP_VK_XR)
+    /* The headset's GPU, whatever scored best. */
+    if (nvkxr_wanted()) {
+        VkPhysicalDevice xpd = nvkxr_physical_device(s_core.inst);
+        uint32_t q = 0;
+        if (xpd && (best = device_score(xpd, s_core.surface, &q)) >= 0) {
+            s_core.phys = xpd;
+            best_q = q;
+        }
+    }
+#endif
     if (best < 0)
         return fail("no Vulkan 1.3 device with a graphics queue%s%s",
                     s_core.surface ? " that presents to the window" : "", VK_SUCCESS);
@@ -362,6 +382,11 @@ static int make_device(void)
     dci.pQueueCreateInfos = &qci;
     dci.enabledExtensionCount = ne;
     dci.ppEnabledExtensionNames = exts;
+#if defined(XBOXRECOMP_VK_XR)
+    if (nvkxr_wanted())
+        r = nvkxr_create_device(s_core.phys, &dci, &s_core.dev);
+    else
+#endif
     r = vkCreateDevice(s_core.phys, &dci, NULL, &s_core.dev);
     if (r != VK_SUCCESS)
         return fail("vkCreateDevice on %s failed: %s", s_core.name, r);
@@ -388,6 +413,9 @@ const struct nvk_core *nvk_core_init(const char *const *inst_exts, unsigned n,
             }
             if ((!make_surface || s_core.surface) && make_device()) {
                 s_state = 1;
+#if defined(XBOXRECOMP_VK_XR)
+                nvkxr_start(&s_core);
+#endif
 #if defined(__ANDROID__)
                 {
                     /* For the app's driver page: what this start runs on. */
@@ -669,7 +697,7 @@ void nvk_buffer_free(struct nvk_buffer *b)
 
 static int image_new(struct nvk_image *im, VkFormat fmt, uint32_t w, uint32_t h,
                      uint32_t levels, VkImageUsageFlags usage, VkImageAspectFlags aspect,
-                     int cube)
+                     int cube, VkSampleCountFlagBits samples)
 {
     VkImageCreateInfo ii;
     VkImageViewCreateInfo vi;
@@ -688,7 +716,7 @@ static int image_new(struct nvk_image *im, VkFormat fmt, uint32_t w, uint32_t h,
     ii.mipLevels = levels ? levels : 1;
     ii.arrayLayers = cube ? 6 : 1;
     ii.flags = cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
-    ii.samples = VK_SAMPLE_COUNT_1_BIT;
+    ii.samples = samples;
     ii.tiling = VK_IMAGE_TILING_OPTIMAL;
     ii.usage = usage;
     ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
@@ -733,13 +761,20 @@ static int image_new(struct nvk_image *im, VkFormat fmt, uint32_t w, uint32_t h,
 int nvk_image_new(struct nvk_image *im, VkFormat fmt, uint32_t w, uint32_t h,
                   uint32_t levels, VkImageUsageFlags usage, VkImageAspectFlags aspect)
 {
-    return image_new(im, fmt, w, h, levels, usage, aspect, 0);
+    return image_new(im, fmt, w, h, levels, usage, aspect, 0, VK_SAMPLE_COUNT_1_BIT);
+}
+
+int nvk_image_new_ms(struct nvk_image *im, VkFormat fmt, uint32_t w, uint32_t h,
+                     VkSampleCountFlagBits samples, VkImageUsageFlags usage, VkImageAspectFlags aspect)
+{
+    return image_new(im, fmt, w, h, 1, usage, aspect, 0, samples);
 }
 
 int nvk_image_new_cube(struct nvk_image *im, VkFormat fmt, uint32_t side, uint32_t levels,
                        VkImageUsageFlags usage)
 {
-    return image_new(im, fmt, side, side, levels, usage, VK_IMAGE_ASPECT_COLOR_BIT, 1);
+    return image_new(im, fmt, side, side, levels, usage, VK_IMAGE_ASPECT_COLOR_BIT, 1,
+                     VK_SAMPLE_COUNT_1_BIT);
 }
 
 void nvk_image_free(struct nvk_image *im)
