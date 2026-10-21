@@ -102,6 +102,9 @@
 #endif
 
 #include "kernel/nv2a_pb_state.h"
+#if defined(XBOXRECOMP_VK_XR)
+#include "d3d/nv2a_vk_xr.h"
+#endif
 #include "kernel/nv2a_backend_common.h"
 #include "window_title.h"
 #include <strings.h>
@@ -368,6 +371,11 @@ int xbox_FramebufferWindowVblank(uint64_t *t_ns, uint64_t *period_ns)
 static uint64_t s_tex_t0;
 void *xbox_FramebufferWindowBackTexture(uint32_t w, uint32_t h)
 {
+#if defined(XBOXRECOMP_VK_XR)
+    /* The headset shows the pictures; the window keeps its last one. */
+    if (nvkxr_presenting())
+        return nvkxr_back_slot(w, h);
+#endif
 #if defined(__APPLE__) || defined(XBOXRECOMP_HAVE_VULKAN)
     void *t = NULL;
     if (!s_layer || !__atomic_load_n(&s_running, __ATOMIC_SEQ_CST) || !w || !h)
@@ -418,6 +426,12 @@ void *xbox_FramebufferWindowBackScene(uint32_t w, uint32_t h, int valid)
 /* The back slot's blit is committed: publish it. */
 void xbox_FramebufferWindowPublishTexture(void)
 {
+#if defined(XBOXRECOMP_VK_XR)
+    if (nvkxr_presenting()) {
+        nvkxr_publish();
+        return;
+    }
+#endif
     publish(s_slot[s_back].w, s_slot[s_back].h, 4, s_tex_t0);
     __atomic_sub_fetch(&s_in_present, 1, __ATOMIC_SEQ_CST);
 }

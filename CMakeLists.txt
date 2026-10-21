@@ -102,6 +102,16 @@ if(XR_SDL_HOST)
     endif()
 endif()
 
+# OpenXR on the Vulkan backend's device (src/d3d/nv2a_vk_xr.c, RECOMP_XR=1):
+# Linux (the Steam Frame). Off unless asked for; needs the OpenXR loader.
+option(XBOXRECOMP_VK_XR "Build OpenXR on the Vulkan backend (Linux)" OFF)
+if(XBOXRECOMP_VK_XR AND XBOXRECOMP_HAVE_VULKAN AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
+    find_package(OpenXR CONFIG REQUIRED)
+    set(XBOXRECOMP_HAVE_VK_XR ON)
+    add_compile_definitions(XBOXRECOMP_VK_XR=1)
+    message(STATUS "xboxrecomp: OpenXR on the Vulkan backend on")
+endif()
+
 # The in-game settings overlay (src/overlay): Dear ImGui over the window's
 # Metal or Vulkan present, opened with Back+Start, F1 or Cmd+, ; it edits the
 # RECOMP_* settings and keeps them in settings.toml. Opt-in: it needs the

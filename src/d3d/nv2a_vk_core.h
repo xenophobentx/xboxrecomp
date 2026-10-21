@@ -189,6 +189,10 @@ struct nvk_image {
 };
 int  nvk_image_new(struct nvk_image *im, VkFormat fmt, uint32_t w, uint32_t h,
                    uint32_t levels, VkImageUsageFlags usage, VkImageAspectFlags aspect);
+/* The same, multisampled (one level): a stereo eye's render target. */
+int  nvk_image_new_ms(struct nvk_image *im, VkFormat fmt, uint32_t w, uint32_t h,
+                      VkSampleCountFlagBits samples, VkImageUsageFlags usage,
+                      VkImageAspectFlags aspect);
 void nvk_image_free(struct nvk_image *im);
 /* A cube image (six layers) of side x side and its cube view. */
 int  nvk_image_new_cube(struct nvk_image *im, VkFormat fmt, uint32_t side, uint32_t levels,
