@@ -77,14 +77,42 @@ static int ui_scale_log(void);
 #include <sys/stat.h>
 #include <time.h>
 #include "nv2a_pcache.h"
+#include "nv2a_vsh_cpu.h"
+#include "video/post_shaders.h"   /* POST_FXAA_BODY: the eyes' anti-aliasing */
 #include "recomp_env.h"
 #include <pthread.h>
 #include "../platform/xr_log.h"   /* the print gate (also force-included) */
+#if defined(XBOXRECOMP_VK_XR)
+#include "nv2a_vk_xr.h"
+#endif
 
 ptrdiff_t xbox_GetMemoryOffset(void);
 
 
 #define LOGP "[vulkan] "
+
+/* Stereo for the headset (RECOMP_XR=1, nv2a_vk_xr.c; RECOMP_XR_STEREO=0 for
+ * the cinema screen only): vertex programs are built with D3D8_GLSL_STEREO
+ * and each frame's draws are kept for a replay per eye at the flip (see
+ * "stereo" below). */
+/* The title's answer to "immersive or cinema" (0 or 1) for the frame at the
+ * flip, if it has one (a weak reference: a title without it is immersive
+ * whenever its picture has world draws). */
+int xbox_vr_scene(void) __attribute__((weak));
+
+static int stereo_wanted(void)
+{
+    static int on = -1;
+    if (on < 0) {
+#if defined(XBOXRECOMP_VK_XR)
+        const char *e = getenv("RECOMP_XR_STEREO");
+        on = nvkxr_wanted() && !(e && *e == '0');
+#else
+        on = 0;
+#endif
+    }
+    return on;
+}
 
 extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
 extern void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch);
@@ -143,6 +171,31 @@ static const char s_vs_pass_glsl[] =
     "void main() {\n"
     "    gl_Position = vec4(a_pos.xy * vp.c[0].xy + vp.c[1].xy,\n"
     "                       clamp(a_pos.z * vp.c[0].z + vp.c[0].w, 0.0, 1.0), 1.0);\n"
+    "    o_d0 = a_d0; o_d1 = a_d1;\n"
+    "    o_t0 = a_t0; o_t1 = a_t1; o_t2 = a_t2; o_t3 = a_t3;\n"
+    "    o_fog = 1.0;\n"
+    "    gl_PointSize = 1.0;\n"
+    "}\n";
+
+/* The same with the eye's push constants (stereo): a billboard or glow drawn
+ * as pretransformed vertices taken to the eye (D3D8_GLSL_EYE_REPROJECT). */
+static const char s_vs_pass_eye_glsl[] =
+    "#version 450\n"
+    "layout(set = 0, binding = 1, std140) uniform VpC { vec4 c[3]; uvec4 u[2]; } vp;\n"
+    D3D8_GLSL_EYE
+    "layout(location = 0) in vec4 a_pos;\n"
+    "layout(location = 1) in vec4 a_d0;\n"
+    "layout(location = 2) in vec4 a_d1;\n"
+    "layout(location = 3) in vec4 a_t0;\n"
+    "layout(location = 4) in vec4 a_t1;\n"
+    "layout(location = 5) in vec4 a_t2;\n"
+    "layout(location = 6) in vec4 a_t3;\n"
+    D3D8_GLSL_VS_OUT
+    "void main() {\n"
+    "    gl_Position = vec4(a_pos.xy * vp.c[0].xy + vp.c[1].xy,\n"
+    "                       clamp(a_pos.z * vp.c[0].z + vp.c[0].w, 0.0, 1.0), 1.0);\n"
+    D3D8_GLSL_EYE_REPROJECT("a_pos.xy * vp.c[0].xy + vp.c[1].xy", "a_pos.z * vp.c[0].z + vp.c[0].w",
+                            "vp.c[0].xy", "vp.c[1].xy")
     "    o_d0 = a_d0; o_d1 = a_d1;\n"
     "    o_t0 = a_t0; o_t1 = a_t1; o_t2 = a_t2; o_t3 = a_t3;\n"
     "    o_fog = 1.0;\n"
@@ -477,6 +530,14 @@ static int serial_wait(uint64_t v, int site)
     return 1;
 }
 
+/* Stereo: while a frame is being kept for the eyes, what is retired may
+ * still be sampled by the eyes' replay at the flip, after the serial it was
+ * retired under: it is held (GARBAGE_HELD) until the flip's last submit
+ * (garbage_unhold). */
+#define GARBAGE_HELD UINT64_MAX
+static int  st_recording(void);
+static void st_rec_spoil(const char *why);
+
 static void garbage_push(const struct nvk_image *im, VkImageView view2,
                          const struct nvk_buffer *buf)
 {
@@ -486,7 +547,9 @@ static void garbage_push(const struct nvk_image *im, VkImageView view2,
         Garbage *n = (Garbage *)realloc(s_garbage, nc * sizeof *n);
         if (!n) {
             /* Out of memory: wait for the GPU and free now; when the
-             * wait fails, they are left (drawing has stopped). */
+             * wait fails, they are left (drawing has stopped). The frame's
+             * draws kept for the eyes may use it: they are dropped. */
+            st_rec_spoil("out of memory for retired resources");
             if (!serial_wait(s_next_serial - 1, NVK_WAIT_SERIAL))
                 return;
             if (im) { struct nvk_image t = *im; nvk_image_free(&t); }
@@ -505,7 +568,16 @@ static void garbage_push(const struct nvk_image *im, VkImageView view2,
     if (buf)
         g->buf = *buf;
     /* Whatever was recorded so far is in this or an earlier serial. */
-    g->serial = s_next_serial;
+    g->serial = st_recording() ? GARBAGE_HELD : s_next_serial;
+}
+
+/* The flip's last submit is made: what was held for the eyes goes with it. */
+static void garbage_unhold(void)
+{
+    size_t i;
+    for (i = 0; i < s_ngarbage; i++)
+        if (s_garbage[i].serial == GARBAGE_HELD)
+            s_garbage[i].serial = s_next_serial;
 }
 
 static void garbage_collect(void)
@@ -559,11 +631,15 @@ static VkCommandBuffer cb_new(void)
     return cb;
 }
 
+static void eye_push_flat(VkCommandBuffer cb);
+
 static void ensure_cmd(void)
 {
     if (!s_cmd) {
         s_cmd = cb_new();
         s_dyn_valid = 0;
+        if (s_cmd)
+            eye_push_flat(s_cmd);
         if (s_vf && s_vf_qp && s_cmd && s_vf->nts < VF_TS) {
             vkCmdWriteTimestamp(s_cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, s_vf_qp,
                                 (uint32_t)((s_vf - s_vfr) * 2 * VF_TS + 2 * s_vf->nts));
@@ -587,6 +663,28 @@ typedef struct DepthTarget DepthTarget;
 typedef struct RenderTarget RenderTarget;
 static RenderTarget *s_enc_rt;   /* the target the open pass draws into */
 static DepthTarget  *s_enc_dt;   /* and its depth attachment, or NULL */
+
+/* Stereo: the frame's passes, clears and draws, kept for the eyes. */
+#define ST_WORLD   1    /* the eye transform (its own or a borrowed projection) */
+#define ST_HUD     2    /* on the HUD panel, not in the eyes */
+#define ST_CAPT    4    /* a program with a kept clip position */
+#define ST_SCREEN  8    /* screen positions already: pretransformed, or a pass-through program */
+#define ST_BAR    16    /* a full-width bar at the top or bottom (letterbox): not in the headset */
+#define ST_REPROJ 32    /* a screen-position draw rebuilt in 3D (D3D8_GLSL_EYE_REPROJECT) */
+#define ST_FULL   64    /* a full-screen 2D quad (fade, flash): stays as drawn */
+#define ST_STRETCH 128  /* the composite into a letterbox: the eyes stretch it back to the full picture */
+static int s_st_on;               /* recording (the headset shows pictures) */
+static float s_st_box[4];         /* the 2D box of the draw being recorded */
+static float s_st_uv[4];          /* and of its texture coordinates (stage 0) */
+static void st_rec_pass(RenderTarget *rt, DepthTarget *dt, int clear, const float c[4],
+                        int zc, int sc, float z, uint32_t st);
+static void st_rec_clear(int depth, const VkClearAttachment *ca, const VkClearRect *cr);
+static void st_rec_spoil(const char *why);
+static void st_rec_draw(RenderTarget *rt, VkDescriptorSet tset, const uint32_t dyn_off[3],
+                        VkDeviceSize vb_off, VkDeviceSize ib_off, uint32_t nidx,
+                        RenderTarget *const src[4], const VkImageView sview[4],
+                        const VkSampler ssmp[4], const D3D8VshStereo *vst, const float (*c)[4],
+                        unsigned extra);
 
 static void end_encoder(void)
 {
@@ -625,6 +723,7 @@ static VkSampler       s_tset_smp[4];
 static void rings_reset(void)
 {
     int k;
+    st_rec_spoil("a ring was reset mid-frame");
     for (k = 0; k < RING_N; k++)
         s_ring_pos[k] = 0;
     memset(s_umemo.valid, 0, sizeof s_umemo.valid);
@@ -838,6 +937,7 @@ struct DepthTarget {
     uint64_t         last_use;
     int              fresh;      /* contents undefined: the next pass clears */
     uint64_t         pass_flip;  /* vk_frame: s_presents + 1 at its last pass */
+    uint32_t         ident;      /* new for every image it is given (stereo) */
 };
 
 /* As Metal: 32 slots hold any frame Burnout 3 draws (14 surfaces in Crash
@@ -859,10 +959,12 @@ struct RenderTarget {
     int              presented;  /* ever picked by present_target */
     uint64_t         pass_flip;  /* vk_frame: s_presents + 1 at its last pass */
     struct nv2a_rt_own own;      /* is the guest memory under it still its own */
+    uint32_t         ident;      /* new for every image it is given (stereo) */
 };
 
 static RenderTarget  s_rt[RT_MAX];
 static uint64_t      s_rt_seq;   /* bumped by every pass begun and draw recorded */
+static uint32_t      s_ident_seq;
 static DepthTarget   s_dt[DT_MAX];
 static uint64_t      s_tick;
 static uint64_t      s_zclears, s_draws_z, s_rtt_binds, s_self_copies;
@@ -969,6 +1071,7 @@ static DepthTarget *depth_target(uint32_t w, uint32_t h)
     e->h = h;
     e->last_use = s_tick;
     e->fresh = 1;
+    e->ident = ++s_ident_seq;
     if (e->hw != w)
         fprintf(stderr, LOGP "zeta 0x%08X: %ux%u depth buffer (%ux%u host)\n",
                 zeta, w, h, e->hw, e->hh);
@@ -1029,6 +1132,10 @@ static void begin_pass(RenderTarget *rt, int clear, const float c[4],
         ri.pDepthAttachment = &da;
         ri.pStencilAttachment = &sa;
         dt->fresh = 0;
+        st_rec_pass(rt, dt, clear, c, zc, sc, da.clearValue.depthStencil.depth,
+                    sa.clearValue.depthStencil.stencil);
+    } else {
+        st_rec_pass(rt, NULL, clear, c, 0, 0, 1.0f, 0);
     }
     vkCmdBeginRendering(s_cmd, &ri);
     s_sn.passes++;
@@ -1358,6 +1465,7 @@ static int rt_grow(RenderTarget *rt, uint32_t w, uint32_t h)
     rt->hw = hw;
     rt->hh = hh;
     rt->dt = NULL;
+    rt->ident = ++s_ident_seq;
     rt_own_reset(rt);
     s_grows++;
     return 1;
@@ -1382,6 +1490,7 @@ static int rt_make(RenderTarget *rt, uint32_t offset, uint32_t w, uint32_t h, ui
     rt->pitch = pitch;
     rt->swz = swz;
     rt->last_use = s_tick;
+    rt->ident = ++s_ident_seq;
     rt_own_reset(rt);
     rt_seed(&rt->im, rt->addr, pitch, w, h, hw, hh, rt->swz);
     if (hw != w)
@@ -1565,6 +1674,7 @@ static void vk_on_clear(uint32_t param)
     } else {
         vkCmdClearAttachments(s_cmd, 1, &ca, 1, &cr);
     }
+    st_rec_clear(0, &ca, &cr);
     s_partial_clears++;
 }
 
@@ -1616,6 +1726,7 @@ static void vk_on_zclear(uint32_t param)
         vkCmdClearAttachments(s_cmd, 1, &ca, 1, &cr);
         if (counting)
             occ_query_begin();
+        st_rec_clear(1, &ca, &cr);
         rt->gen = ++s_rt_seq;
         return;
     }
@@ -1771,6 +1882,7 @@ typedef struct {
     int            used, bad;
     uint64_t       kid;       /* nv2a_fnv64 of the slots: the disk key's id */
     VkShaderModule mod;
+    D3D8VshStereo  st;        /* what stereo can do with it (D3D8_GLSL_STEREO) */
 } VsEntry;
 static VsEntry s_vs[VS_MAX];
 
@@ -1787,7 +1899,8 @@ static void pc_warm_begin(int first);
  * its inputs in *inputs. Any thread: `parsed` and `glsl` (65536) are the
  * caller's. */
 static VkShaderModule vs_build(const uint32_t *slots, int n, uint32_t hash, uint16_t *inputs,
-                               NV2AVshProgram *parsed, char *glsl, int prewarm)
+                               NV2AVshProgram *parsed, char *glsl, int prewarm,
+                               D3D8VshStereo *st)
 {
     VkShaderModule m = VK_NULL_HANDLE;
     uint64_t t = now_ns();
@@ -1795,7 +1908,9 @@ static VkShaderModule vs_build(const uint32_t *slots, int n, uint32_t hash, uint
 
     snprintf(what, sizeof what, "program %08X", hash);
     d3d8_vsh_parse(slots, n, parsed);
-    if (d3d8_vsh_generate_glsl(parsed, D3D8_GLSL_SCREEN_SPACE, glsl, 65536) <= 0) {
+    d3d8_vsh_stereo_info(parsed, st);
+    if (d3d8_vsh_generate_glsl(parsed, D3D8_GLSL_SCREEN_SPACE
+                               | (stereo_wanted() ? D3D8_GLSL_STEREO : 0), glsl, 65536) <= 0) {
         COUNT(s_compile_errors);
         fprintf(stderr, LOGP "%s: no GLSL\n", what);
     } else if ((m = module_from_glsl(NVK_STAGE_VERTEX, glsl, what)) != VK_NULL_HANDLE) {
@@ -1817,7 +1932,8 @@ static VsEntry *vs_find(uint32_t hash)
 }
 
 /* s_pc_mu held. A free entry taken for `hash`, or NULL when the table is full. */
-static VsEntry *vs_take(uint32_t hash, uint64_t kid, VkShaderModule mod, uint16_t inputs)
+static VsEntry *vs_take(uint32_t hash, uint64_t kid, VkShaderModule mod, uint16_t inputs,
+                        const D3D8VshStereo *st)
 {
     int i;
     for (i = 0; i < VS_MAX && s_vs[i].used; i++)
@@ -1828,6 +1944,7 @@ static VsEntry *vs_take(uint32_t hash, uint64_t kid, VkShaderModule mod, uint16_
     s_vs[i].kid = kid;
     s_vs[i].mod = mod;
     s_vs[i].inputs = inputs;
+    s_vs[i].st = *st;
     s_vs[i].bad = mod ? 0 : 1;
     s_vs[i].used = 1;
     return &s_vs[i];
@@ -1872,16 +1989,17 @@ static VsEntry *vs_cache(void)
         const uint32_t *slots = &v->prog[v->start][0];
         uint16_t inputs = 0;
         VkShaderModule mod;
+        D3D8VshStereo st;
         if (!len || len > NV2A_VSH_SLOTS - v->start)
             len = NV2A_VSH_SLOTS - v->start;
-        mod = vs_build(slots, (int)len, hash, &inputs, &parsed, glsl, 0);
+        mod = vs_build(slots, (int)len, hash, &inputs, &parsed, glsl, 0, &st);
         pthread_mutex_lock(&s_pc_mu);
         if ((e = vs_find(hash)) != NULL) {
             if (mod)                    /* the pre-warm thread was first */
                 vkDestroyShaderModule(s_dev, mod, NULL);
             mod = VK_NULL_HANDLE;
         } else {
-            e = vs_take(hash, vs_kid(slots, (size_t)len * 16u), mod, inputs);
+            e = vs_take(hash, vs_kid(slots, (size_t)len * 16u), mod, inputs, &st);
         }
         pthread_mutex_unlock(&s_pc_mu);
         if (!e)
@@ -2202,7 +2320,9 @@ static VkPipeline pipeline_new(const PsoKey *k, int prewarm)
     rs.lineWidth = 1.0f;
     memset(&ms, 0, sizeof ms);
     ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    /* bits 8..15: a stereo eye's multisampled target (pipeline_ms) */
+    ms.rasterizationSamples = (k->depth >> 8) ? (VkSampleCountFlagBits)(k->depth >> 8)
+                                              : VK_SAMPLE_COUNT_1_BIT;
     memset(&ds, 0, sizeof ds);
     ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
     memset(&cba, 0, sizeof cba);
@@ -2316,6 +2436,46 @@ static void pso_disk(const PsoKey *k, PsoDisk *d)
     memcpy(d->blend, k->blend, sizeof d->blend);
 }
 
+static PsoKey s_pso_key_last;   /* the key of the last pipeline() (stereo keeps it) */
+
+/* The pipeline of `base` for a target of `samples` samples (a stereo eye's
+ * multisampled scene), made on first use and kept with the others. */
+static VkPipeline pipeline_ms(const PsoKey *base, uint32_t samples)
+{
+    PsoKey k = *base;
+    uint32_t i;
+    int found;
+    VkPipeline p;
+
+    k.depth = (k.depth & 0xFFu) | (samples << 8);
+    pthread_mutex_lock(&s_pc_mu);
+    i = pso_slot(&k, &found);
+    pthread_mutex_unlock(&s_pc_mu);
+    if (found)
+        return s_pso[i].p;
+    if (s_pso_n + 1 >= PSO_CAP * 3 / 4)
+        return VK_NULL_HANDLE;
+    p = pipeline_new(&k, 0);
+    pthread_mutex_lock(&s_pc_mu);
+    i = pso_slot(&k, &found);
+    if (!found) {
+        s_pso[i].k = k;
+        s_pso[i].p = p;
+        s_pso[i].used = 1;
+        s_pso_n++;
+    }
+    pthread_mutex_unlock(&s_pc_mu);
+    if (found) {
+        if (p)
+            vkDestroyPipeline(s_dev, p, NULL);
+    } else if (p) {
+        PsoDisk dk;
+        pso_disk(&k, &dk);
+        pc_put(PC_PSO, &dk, sizeof dk);
+    }
+    return s_pso[i].p;
+}
+
 static VkPipeline pipeline(VkShaderModule vs, VkShaderModule fs, uint32_t nf4,
                            enum nv2a_topology topo)
 {
@@ -2349,6 +2509,7 @@ static VkPipeline pipeline(VkShaderModule vs, VkShaderModule fs, uint32_t nf4,
     k.blend[1] = k.blend[0] ? g->blend_sfactor : 0;
     k.blend[2] = k.blend[0] ? g->blend_dfactor : 0;
     k.blend[3] = k.blend[0] ? (uint32_t)blend_op(g->blend_equation) : 0;
+    s_pso_key_last = k;
     memcpy(w, &k, sizeof w);
     for (q = 0; q < sizeof w / 4; q++)
         mh = (mh ^ w[q]) * 16777619u;
@@ -3206,6 +3367,9 @@ static RenderTarget *rt_texture(const Stage *t, RenderTarget *cur, VkImageView *
         nvk_image_to(s_cmd, &s_self, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     }
     s_self_offset = self->offset;
+    /* The eyes would sample this copy of the frame's own target: no stereo
+     * for the frame (the replay has no copy of its own to make). */
+    st_rec_spoil("a target sampled while drawn into");
     s_self_copies++;
     {
         static int said;
@@ -4095,6 +4259,8 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
     int use_z = v->depth_enable || use_s;
     VkImageView sview[4];
     VkSampler   ssmp[4];
+    RenderTarget *ssrc[4] = { NULL, NULL, NULL, NULL };
+    const D3D8VshStereo *vst = NULL;
     VkDescriptorSet tset;
 
     if (!init())
@@ -4114,6 +4280,7 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
             return;
         }
         vmod = e->mod;
+        vst = &e->st;
         for (i = 0; i < NV2A_VS_MAX_INPUTS; i++)
             if (e->inputs & (1u << i))
                 slot[nf4++] = (int)i;
@@ -4216,7 +4383,7 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
             if (t->mode == 3 && t->cube && fmod != s_fs_basic) {   /* samplerCube */
                 sview[k] = cube_bind(t);
             } else if ((t->mode == 3 || !stage_signed(t))
-                       && rt_texture(t, rt, &sview[k], &sw, &sh) != NULL) {
+                       && (ssrc[k] = rt_texture(t, rt, &sview[k], &sw, &sh)) != NULL) {
                 if (!nv2a_tex_size_from_format(t->color)) {
                     pc.b.tex_scale[k][0] = 1.0f / (float)sw;
                     pc.b.tex_scale[k][1] = 1.0f / (float)sh;
@@ -4421,6 +4588,119 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
     vkCmdBindVertexBuffers(s_cmd, 0, 1, &s_ring[RING_VB].buf, &vb_off);
     vkCmdBindIndexBuffer(s_cmd, s_ring[RING_IB].buf, ib_off, VK_INDEX_TYPE_UINT32);
     vkCmdDrawIndexed(s_cmd, nidx, 1, 0, 0, 0);
+    {
+        /* Stereo, from the screen positions a 2D draw was given: a
+         * letterbox (full width, only in bands at the top and bottom: the
+         * race's 16-row bars, the crash cameras' wider ones with their
+         * lines), or a full-screen quad (fades and flashes: kept flat). */
+        unsigned extra = 0;
+        int ortho = 0;   /* 1: orthographic rows, 2: no rows (run on the CPU) */
+        const float *rx = NULL, *ry = NULL, *rw = NULL;
+        memset(s_st_box, 0, sizeof s_st_box);
+        memset(s_st_uv, 0, sizeof s_st_uv);
+        if (s_st_on && vst && vst->capture) {
+            /* A program that keeps a clip position but projects nothing is
+             * 2D: one with no position rows at all (the crash cameras' bars:
+             * v0 plus an offset, in pixels) or an orthographic matrix (a w row
+             * with no x, y or z: Burnout's HUD). Its screen positions come
+             * from running it on the CPU (nv2a_vsh_cpu.h). Rows whose
+             * projection only cannot be read (scaled parts) stay 3D. */
+            if (vst->rows[0] < 0 && vst->rows[1] < 0 && vst->rows[3] < 0) {
+                ortho = 2;
+            } else if (vst->rows[0] >= 0 && vst->rows[1] >= 0 && vst->rows[3] >= 0) {
+                rw = v->c[vst->rows[3]];
+                rx = v->c[vst->rows[0]];
+                ry = v->c[vst->rows[1]];
+                ortho = fabsf(rw[0]) + fabsf(rw[1]) + fabsf(rw[2]) < 1e-6f * (fabsf(rw[3]) + 1e-30f);
+            }
+            if (ortho)
+                extra |= ST_SCREEN;
+        }
+        /* Only the vertices the draw uses, all of them (a bound that cannot
+         * see the whole draw decides nothing: a bar left out drops it). */
+        if (s_st_on && (!vst || !vst->capture || ortho) && (slot[0] == 0 || ortho == 2) && count
+                && nidx <= (ortho == 2 ? 24u : 1024u)) {
+            float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f, h = (float)rt->h;
+            float tops[2] = { -1.0f, -1.0f }, bots[2] = { -1.0f, -1.0f };
+            int mid = 0, nt = 0, nb = 0;
+            uint32_t q, j;
+            int t0 = -1;
+            for (q = 0; q < nf4; q++)
+                if (slot[q] == 9)
+                    t0 = (int)q;
+            s_st_uv[0] = s_st_uv[1] = 1e9f;
+            s_st_uv[2] = s_st_uv[3] = -1e9f;
+            for (j = 0; j < nidx; j++) {
+                const float *p;
+                q = idx[j];
+                if (q >= count)
+                    continue;
+                p = vf + (size_t)q * nf4 * 4u;
+                float sp[2];
+                if (ortho == 1) {
+                    /* the rows applied to v0 (slot 0), through c[58]/c[59] */
+                    float w = p[0] * rw[0] + p[1] * rw[1] + p[2] * rw[2] + p[3] * rw[3];
+                    if (w == 0.0f)
+                        w = 1.0f;
+                    sp[0] = (p[0] * rx[0] + p[1] * rx[1] + p[2] * rx[2] + p[3] * rx[3]) / w
+                            * v->c[58][0] + v->c[59][0];
+                    sp[1] = (p[0] * ry[0] + p[1] * ry[1] + p[2] * ry[2] + p[3] * ry[3]) / w
+                            * v->c[58][1] + v->c[59][1];
+                    p = sp;
+                } else if (ortho == 2) {
+                    float in[NV2A_VSH_INPUTS][4];
+                    Nv2aVshOut o;
+                    uint32_t a;
+                    memset(in, 0, sizeof in);
+                    for (a = 0; a < nf4; a++)
+                        if (slot[a] >= 0 && slot[a] < NV2A_VSH_INPUTS)
+                            memcpy(in[slot[a]], p + a * 4, 16);
+                    nv2a_vsh_run((const uint32_t (*)[4])v->prog, v->start, (float (*)[4])v->c, 0,
+                                 (const float (*)[4])in, &o);
+                    if (!o.ok)
+                        break;
+                    sp[0] = o.o[NV2A_VSH_O_POS][0];
+                    sp[1] = o.o[NV2A_VSH_O_POS][1];
+                    p = sp;   /* only x and y are read below */
+                }
+                if (t0 >= 0 && !ortho) {
+                    const float *t = p + t0 * 4;
+                    s_st_uv[0] = t[0] < s_st_uv[0] ? t[0] : s_st_uv[0];
+                    s_st_uv[1] = t[1] < s_st_uv[1] ? t[1] : s_st_uv[1];
+                    s_st_uv[2] = t[0] > s_st_uv[2] ? t[0] : s_st_uv[2];
+                    s_st_uv[3] = t[1] > s_st_uv[3] ? t[1] : s_st_uv[3];
+                }
+                x0 = p[0] < x0 ? p[0] : x0;
+                x1 = p[0] > x1 ? p[0] : x1;
+                y0 = p[1] < y0 ? p[1] : y0;
+                y1 = p[1] > y1 ? p[1] : y1;
+                if (p[1] > 0.3f * h && p[1] < 0.7f * h)
+                    mid = 1;
+                else if (p[1] <= 0.3f * h) {
+                    if (nt < 2 && (!nt || fabsf(tops[0] - p[1]) > 0.5f))
+                        tops[nt++] = p[1];
+                } else if (nb < 2 && (!nb || fabsf(bots[0] - p[1]) > 0.5f)) {
+                    bots[nb++] = p[1];
+                }
+            }
+            s_st_box[0] = x0;
+            s_st_box[1] = y0;
+            s_st_box[2] = x1;
+            s_st_box[3] = y1;
+            if (x0 <= 0.02f * (float)rt->w && x1 >= 0.98f * (float)rt->w) {
+                /* the bars and their lines (the crash cameras' come in from
+                 * the edges), the caption strip: full width, only in the
+                 * bands, each part with two edges; a full-screen quad has
+                 * one edge in each band */
+                if (!mid && (nt == 2 || nb == 2))
+                    extra |= ST_BAR;
+                else if (y0 <= 0.02f * h && y1 >= 0.98f * h)
+                    extra |= ST_FULL;
+            }
+        }
+        st_rec_draw(rt, tset, dyn_off, vb_off, ib_off, nidx, ssrc, sview, ssmp, vst,
+                    (const float (*)[4])v->c, extra);
+    }
     s_draws++;
     s_sn.draws++;
     s_sn.d2 += s_draw_2d != 0;
@@ -4432,6 +4712,1587 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
     }
     rt->gen = ++s_rt_seq;
 }
+
+/* ---- stereo: the frame again for each eye (RECOMP_XR=1) ---------------------
+ *
+ * Every pass, clear and draw of a frame is kept as it was recorded: the
+ * pipeline, dynamic state, descriptor sets and the ring offsets of its
+ * vertices, indices and constants, which stay valid until the frame's slot
+ * is reused (frame_advance) unless a ring is reset before (a full ring, a
+ * readback: the frame then has no stereo). What is retired meanwhile is held
+ * until the flip's last submit (garbage_unhold). At the flip the passes that
+ * make the presented picture are drawn again for each eye, into eye images
+ * of their own (one per render target and depth buffer, per eye, at the
+ * headset's eye size), after the frame's own draws, which stay as they are
+ * for everything the guest sees (reports, write-backs, the window).
+ *
+ * The picture's targets (membership): the presented one; any screen-shaped
+ * target (within 5% of its aspect, at least an eighth of its width) a
+ * picture target samples; any screen-shaped target that samples a picture
+ * target; repeated until nothing joins. Burnout 3's scene, bloom levels and
+ * radial blur join; the reflection cube faces (square) and the small
+ * auxiliary targets do not, and the eyes sample those as drawn.
+ *
+ * Each draw in the picture, by what it is:
+ *   world      a vertex program with a kept clip position (D3D8_GLSL_STEREO)
+ *              and a perspective projection in its position rows: eye.m =
+ *              P_eye * V_eye<-game * inverse(P_game); one whose projection
+ *              cannot be read takes the last world draw's (borrowed)
+ *   screen     screen positions already (pretransformed vertices, programs
+ *              that pass them through, orthographic programs: billboards,
+ *              glows, particles): rebuilt in 3D from their depth through the
+ *              game camera (D3D8_GLSL_EYE_REPROJECT)
+ *   composite  what reads another picture target (bloom, blur, the frame's
+ *              composite): as drawn, the composite into a letterbox
+ *              stretched back over the whole eye
+ *   HUD        the presented target's 2D after the composite: left out of
+ *              the eyes, drawn once over black and once over white and
+ *              solved for alpha, shown on a panel (see below)
+ *   letterbox  full-width 2D bars and lines at the top or bottom: left out
+ * A frame the title marks as its front end (xbox_vr_scene) is drawn for
+ * fixed eyes instead and shown on the cinema screen, the HUD in it. */
+enum { EV_PASS, EV_CCLEAR, EV_ZCLEAR, EV_DRAW };
+typedef struct {
+    uint8_t         kind, flags, zc, sc;
+    int             clear;
+    RenderTarget   *rt;
+    uint32_t        rt_ident, hw, hh;
+    DepthTarget    *dt;
+    uint32_t        dt_ident;
+    float           c[4], z;
+    uint32_t        st;
+    VkClearAttachment ca;
+    VkClearRect     cr;
+    DynState        n;
+    VkDescriptorSet tset;
+    uint32_t        dyn_off[3];
+    VkDeviceSize    vb_off, ib_off;
+    uint32_t        nidx;
+    RenderTarget   *src[4];
+    uint32_t        src_ident[4];
+    VkImageView     sview[4];
+    VkSampler       ssmp[4];
+    float           proj[6];
+    float           box[4];      /* a 2D draw's screen box (guest pixels), for the draw log */
+    float           uv[4];       /* and its first texture coordinates' box */
+    float           vp[4];       /* c[58].xy, c[59].xy: the game's viewport */
+    PsoKey          key;         /* its pipeline's key (a multisampled eye's variant) */
+    float           camvp[4];    /* the camera's c[58].xy, c[59].xy (borrowed with proj) */
+} StEv;
+static StEv       *s_st_ev;
+static size_t      s_st_n, s_st_cap;
+static const char *s_st_bad;          /* why this frame has no stereo, or NULL */
+static uint64_t    s_st_frames, s_st_none, s_st_spoilt, s_st_draws, s_st_world, s_st_borrow,
+                   s_st_reproj, s_st_bars, s_st_stretch;
+
+/* The eyes' resolution against the frame's (host pixels): x and y factors
+ * for every picture target, set per frame from the headset's eye size. */
+static float s_st_fx = 1.0f, s_st_fy = 1.0f;
+
+static uint32_t st_sx(uint32_t v) { return (uint32_t)((float)v * s_st_fx + 0.5f); }
+static uint32_t st_sy(uint32_t v) { return (uint32_t)((float)v * s_st_fy + 0.5f); }
+
+/* Multisampled eye images (RECOMP_XR_MSAA=2; off by default): for the picture targets with
+ * a depth buffer (the scene), resolved into the eye image at every pass's
+ * end, so what samples them later reads the eye image as before. */
+static struct nvk_image s_eye_ms[2][RT_MAX];
+static uint32_t         s_eye_ms_ident[2][RT_MAX];
+static struct nvk_image s_eye_dms[2][DT_MAX];
+static uint32_t         s_eye_dms_ident[2][DT_MAX];
+static uint32_t         s_st_samples;   /* 1: off */
+
+/* Eye images: per eye, per render target slot and per depth slot. */
+static struct nvk_image s_eye_rt[2][RT_MAX];
+static uint32_t         s_eye_rt_ident[2][RT_MAX];
+static struct nvk_image s_eye_dt[2][DT_MAX];
+static uint32_t         s_eye_dt_ident[2][DT_MAX];
+
+/* The HUD: the presented target's draws after the picture's composite (its
+ * first draw that reads another picture target) that are not world draws
+ * and read no picture target, drawn once over black and once over white
+ * (B, W) and solved for alpha: a = 1 - mean(W - B), colour B
+ * (premultiplied). The eyes leave them out; the headset
+ * shows the result on a panel. */
+static struct nvk_image s_hud_im[3];          /* over black, over white, solved */
+static struct nvk_image s_hud_z;              /* a depth buffer for passes that had one */
+static VkPipeline       s_hud_pso;
+static VkSampler        s_hud_smp;
+static int              s_hud_tried;
+static uint64_t         s_st_hud_frames;
+static const char s_hud_vs_glsl[] =
+    "#version 450\n"
+    "layout(location = 0) out vec2 uv;\n"
+    "void main() {\n"
+    "    vec2 p = vec2(float((gl_VertexIndex << 1) & 2), float(gl_VertexIndex & 2));\n"
+    "    uv = p;\n"
+    "    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+    "}\n";
+/* The eyes' FXAA (RECOMP_XR_FXAA, on): the window presenter's FXAA
+ * (video/post_shaders.h) over each eye's final picture before it goes to
+ * the headset; the HUD panel is left as it is. */
+static VkPipeline       s_fxaa_pso;
+static VkSampler        s_fxaa_smp;
+static struct nvk_image s_eye_post[2];
+static const char s_fxaa_fs_glsl[] =
+    "#version 450\n"
+    "#define float2 vec2\n#define float3 vec3\n#define float4 vec4\n"
+    "#define saturate(x) clamp((x), 0.0, 1.0)\n"
+    "layout(set = 1, binding = 0) uniform sampler2D tex0;\n"
+    "layout(location = 0) in vec2 vUv;\n"
+    "layout(location = 0) out vec4 outColor;\n"
+    "#define FETCH(p) texture(tex0, (p)).rgb\n"
+    "#define RETURN(c) { outColor = vec4((c), 1.0); return; }\n"
+    "void main() {\n"
+    "    vec2 uv = vUv; vec2 rcp = 1.0 / vec2(textureSize(tex0, 0)); float sharp = 0.0;\n"
+    POST_FXAA_BODY
+    "}\n";
+static const char s_hud_fs_glsl[] =
+    "#version 450\n"
+    "layout(set = 1, binding = 0) uniform sampler2D over_black;\n"
+    "layout(set = 1, binding = 1) uniform sampler2D over_white;\n"
+    "layout(location = 0) in vec2 uv;\n"
+    "layout(location = 0) out vec4 o;\n"
+    "void main() {\n"
+    "    vec3 b = texture(over_black, uv).rgb, w = texture(over_white, uv).rgb;\n"
+    "    float a = clamp(1.0 - (w.r - b.r + w.g - b.g + w.b - b.b) / 3.0, 0.0, 1.0);\n"
+    "    o = vec4(min(b, vec3(a)), a);\n"
+    "}\n";
+
+static void eye_push_flat(VkCommandBuffer cb)
+{
+    uint32_t pc[D3D8_GLSL_EYE_BYTES / 4];
+    if (!stereo_wanted())
+        return;
+    memset(pc, 0, sizeof pc);
+    vkCmdPushConstants(cb, s_playout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof pc, pc);
+}
+
+static StEv *st_new(int kind)
+{
+    StEv *e;
+    if (!s_st_on || s_st_bad)
+        return NULL;
+    if (s_st_n == s_st_cap) {
+        size_t nc = s_st_cap ? s_st_cap * 2 : 4096;
+        StEv *n = (StEv *)realloc(s_st_ev, nc * sizeof *n);
+        if (!n) {
+            s_st_bad = "out of memory";
+            return NULL;
+        }
+        s_st_ev = n;
+        s_st_cap = nc;
+    }
+    e = &s_st_ev[s_st_n++];
+    memset(e, 0, sizeof *e);
+    e->kind = (uint8_t)kind;
+    return e;
+}
+
+static void st_rec_spoil(const char *why)
+{
+    if (s_st_n && !s_st_bad)
+        s_st_bad = why;
+}
+
+static int st_recording(void)
+{
+    return s_st_on && s_st_n && !s_st_bad;
+}
+
+static void st_rec_pass(RenderTarget *rt, DepthTarget *dt, int clear, const float c[4],
+                        int zc, int sc, float z, uint32_t st)
+{
+    StEv *e = st_new(EV_PASS);
+    if (!e)
+        return;
+    e->rt = rt;
+    e->rt_ident = rt->ident;
+    e->hw = rt->hw;
+    e->hh = rt->hh;
+    e->dt = dt;
+    e->dt_ident = dt ? dt->ident : 0;
+    e->clear = clear;
+    if (clear)
+        memcpy(e->c, c, sizeof e->c);
+    e->zc = (uint8_t)zc;
+    e->sc = (uint8_t)sc;
+    e->z = z;
+    e->st = st;
+}
+
+static void st_rec_clear(int depth, const VkClearAttachment *ca, const VkClearRect *cr)
+{
+    StEv *e = st_new(depth ? EV_ZCLEAR : EV_CCLEAR);
+    if (!e)
+        return;
+    e->ca = *ca;
+    e->cr = *cr;
+}
+
+/* The camera's projection from a program's view-projection rows, which are
+ * the projection times a rigid (possibly uniformly scaled) transform.
+ * out: sx, sy (signs of the screen: x right, y
+ * up), ox, oy, Q, Z0. 0 when the rows are not a perspective projection. */
+static int camera_projection(const float (*c)[4], const int rows[4], float out[6])
+{
+    const float *rx = c[rows[0]], *ry = c[rows[1]], *rz = c[rows[2]], *rw = c[rows[3]];
+    const float *vp = c[58];
+    float ww = rw[0] * rw[0] + rw[1] * rw[1] + rw[2] * rw[2], n, ox, oy, q, ex[3], ey[3], ez[3];
+    float sx, sy, z0;
+    int i;
+
+    if (!(ww > 1e-12f))
+        return 0;
+    n = sqrtf(ww);
+    ox = (rx[0] * rw[0] + rx[1] * rw[1] + rx[2] * rw[2]) / ww;
+    oy = (ry[0] * rw[0] + ry[1] * rw[1] + ry[2] * rw[2]) / ww;
+    q = (rz[0] * rw[0] + rz[1] * rw[1] + rz[2] * rw[2]) / ww;
+    for (i = 0; i < 3; i++) {
+        ex[i] = rx[i] - ox * rw[i];
+        ey[i] = ry[i] - oy * rw[i];
+        ez[i] = rz[i] - q * rw[i];
+    }
+    if (sqrtf(ez[0] * ez[0] + ez[1] * ez[1] + ez[2] * ez[2]) > 1e-3f * n)
+        return 0;
+    sx = sqrtf(ex[0] * ex[0] + ex[1] * ex[1] + ex[2] * ex[2]) / n;
+    sy = sqrtf(ey[0] * ey[0] + ey[1] * ey[1] + ey[2] * ey[2]) / n;
+    if (sx < 1e-4f || sy < 1e-4f)
+        return 0;
+    if (fabsf(ex[0] * ey[0] + ex[1] * ey[1] + ex[2] * ey[2]) > 0.02f * sx * sy * ww)
+        return 0;
+    z0 = rz[3] - q * rw[3];
+    if (!(fabsf(z0) > 1e-9f))
+        return 0;
+    out[0] = vp[0] < 0.0f ? -sx : sx;
+    out[1] = vp[1] > 0.0f ? -sy : sy;
+    out[2] = ox;
+    out[3] = oy;
+    out[4] = q;
+    out[5] = z0;
+    return 1;
+}
+
+static void st_rec_draw(RenderTarget *rt, VkDescriptorSet tset, const uint32_t dyn_off[3],
+                        VkDeviceSize vb_off, VkDeviceSize ib_off, uint32_t nidx,
+                        RenderTarget *const src[4], const VkImageView sview[4],
+                        const VkSampler ssmp[4], const D3D8VshStereo *vst, const float (*c)[4],
+                        unsigned extra)
+{
+    StEv *e = st_new(EV_DRAW);
+    int k;
+    if (!e)
+        return;
+    e->rt = rt;
+    e->rt_ident = rt->ident;
+    e->n = s_dyn;
+    e->key = s_pso_key_last;
+    e->tset = tset;
+    memcpy(e->dyn_off, dyn_off, sizeof e->dyn_off);
+    e->vb_off = vb_off;
+    e->ib_off = ib_off;
+    e->nidx = nidx;
+    for (k = 0; k < 4; k++) {
+        e->src[k] = src[k];
+        e->src_ident[k] = src[k] ? src[k]->ident : 0;
+        e->sview[k] = sview[k];
+        e->ssmp[k] = ssmp[k];
+    }
+    e->flags |= (uint8_t)extra;
+    if (extra & ST_SCREEN)
+        vst = NULL;           /* 2D through an orthographic program */
+    e->vp[0] = c[58][0];
+    e->vp[1] = c[58][1];
+    e->vp[2] = c[59][0];
+    e->vp[3] = c[59][1];
+    memcpy(e->box, s_st_box, sizeof e->box);
+    memcpy(e->uv, s_st_uv, sizeof e->uv);
+    if (!vst || !vst->capture)
+        e->flags |= ST_SCREEN;
+    else
+        e->flags |= ST_CAPT;
+    if (vst && vst->capture && vst->rows[0] >= 0 && vst->rows[1] >= 0 && vst->rows[2] >= 0
+            && vst->rows[3] >= 0 && camera_projection(c, vst->rows, e->proj)) {
+        static int said;
+        e->flags |= ST_WORLD;
+        memcpy(e->camvp, e->vp, sizeof e->camvp);
+        if ((said < 4 && rt->w >= 640) || vk_trace()) {
+            /* The game's viewport (c[58] scale, c[59] offset) and projection,
+             * for the eyes' crop and scale. */
+            said++;
+            fprintf(stderr, LOGP "stereo: world draw into %ux%u@%08X: viewport scale %.2f %.2f %.1f"
+                    " offset %.2f %.2f %.1f; projection sx %.4f sy %.4f ox %.4f oy %.4f Q %.6f"
+                    " Z0 %.4f (rows c%d..c%d)\n", rt->w, rt->h, rt->offset, c[58][0], c[58][1],
+                    c[58][2], c[59][0], c[59][1], c[59][2], e->proj[0], e->proj[1], e->proj[2],
+                    e->proj[3], e->proj[4], e->proj[5], vst->rows[0], vst->rows[3]);
+        }
+    }
+}
+
+static void st_rec_reset(void)
+{
+    s_st_n = 0;
+    s_st_bad = NULL;
+#if defined(XBOXRECOMP_VK_XR)
+    s_st_on = stereo_wanted() && nvkxr_presenting();
+#endif
+}
+
+/* Column-major 4x4: out = a * b. */
+static void mat4_mul(const float *a, const float *b, float *out)
+{
+    float r[16];
+    int i, j, k;
+    for (j = 0; j < 4; j++)
+        for (i = 0; i < 4; i++) {
+            float sum = 0.0f;
+            for (k = 0; k < 4; k++)
+                sum += a[k * 4 + i] * b[j * 4 + k];
+            r[j * 4 + i] = sum;
+        }
+    memcpy(out, r, sizeof r);
+}
+
+#if defined(XBOXRECOMP_VK_XR)
+/* Game view (x right, y up, z ahead, game units) to an eye at `e` (relative
+ * to the anchor: OpenXR, z back, metres). */
+static void eye_from_game(const nvkxr_eye *v, float scale, float out[16])
+{
+    float x = v->quat[0], y = v->quat[1], z = v->quat[2], w = v->quat[3];
+    float r[9] = {
+        1 - 2 * (y * y + z * z), 2 * (x * y + z * w), 2 * (x * z - y * w),
+        2 * (x * y - z * w), 1 - 2 * (x * x + z * z), 2 * (y * z + x * w),
+        2 * (x * z + y * w), 2 * (y * z - x * w), 1 - 2 * (x * x + y * y),
+    };
+    const float *p = v->pos;
+    float anchor_from_game[16] = {
+        1.0f / scale, 0, 0, 0,
+        0, 1.0f / scale, 0, 0,
+        0, 0, -1.0f / scale, 0,
+        0, 0, 0, 1,
+    };
+    float eye_from_anchor[16];
+    int i, j;
+    for (i = 0; i < 3; i++)
+        for (j = 0; j < 3; j++)
+            eye_from_anchor[j * 4 + i] = r[i * 3 + j];
+    for (i = 0; i < 3; i++) {
+        eye_from_anchor[i * 4 + 3] = 0.0f;
+        eye_from_anchor[12 + i] = -(r[i * 3 + 0] * p[0] + r[i * 3 + 1] * p[1] + r[i * 3 + 2] * p[2]);
+    }
+    eye_from_anchor[15] = 1.0f;
+    mat4_mul(eye_from_anchor, anchor_from_game, out);
+}
+
+/* Game clip space to the eye's: the game projection undone, the eye's view
+ * and projection applied, with D3D's depth over the game's own near and far
+ * planes. */
+static void eye_clip_transform(const float efg[16], const float tan4[4], float scale,
+                               const float proj[6], float out[16])
+{
+    const float sx = proj[0], sy = proj[1], ox = proj[2], oy = proj[3], q = proj[4], z0 = proj[5];
+    float tw = tan4[1] - tan4[0], th = tan4[2] - tan4[3];
+    float game_from_clip[16] = {
+        1.0f / sx, 0, 0, 0,
+        0, 1.0f / sy, 0, 0,
+        0, 0, 0, 1.0f / z0,
+        -ox / sx, -oy / sy, 1.0f, -q / z0,
+    };
+    float clip_from_eye[16] = {
+        2.0f / tw, 0, 0, 0,
+        0, 2.0f / th, 0, 0,
+        (tan4[1] + tan4[0]) / tw, (tan4[2] + tan4[3]) / th, -q, -1.0f,
+        0, 0, z0 / scale, 0,
+    };
+    float m[16];
+    mat4_mul(efg, game_from_clip, m);
+    mat4_mul(clip_from_eye, m, out);
+}
+
+static int st_shaped(const RenderTarget *rt, const RenderTarget *p)
+{
+    float a = (float)rt->w / (float)rt->h, b = (float)p->w / (float)p->h;
+    return rt->w * 8u >= p->w && fabsf(a - b) <= 0.05f * b;
+}
+
+/* An eye image for target slot i (as rt's image: size, format), cleared to
+ * transparent black when new; NULL when it cannot be made. */
+static VkImageView s_eye_opaque[2][RT_MAX];   /* alpha read as 1 (an R5G6B5 target's) */
+
+static struct nvk_image *st_eye_rt(int eye, RenderTarget *rt)
+{
+    int i = (int)(rt - s_rt);
+    struct nvk_image *im = &s_eye_rt[eye][i];
+    if (im->img && s_eye_rt_ident[eye][i] == rt->ident && im->w == st_sx(rt->hw)
+            && im->h == st_sy(rt->hh))
+        return im;
+    if (im->img)
+        garbage_push(im, s_eye_opaque[eye][i], NULL);
+    s_eye_opaque[eye][i] = VK_NULL_HANDLE;
+    memset(im, 0, sizeof *im);
+    if (!nvk_image_new(im, rt->im.format, st_sx(rt->hw), st_sy(rt->hh), 1,
+                       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
+                       | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                       VK_IMAGE_ASPECT_COLOR_BIT)) {
+        memset(im, 0, sizeof *im);
+        return NULL;
+    }
+    s_eye_rt_ident[eye][i] = rt->ident;
+    {
+        VkClearColorValue z;
+        VkImageSubresourceRange r;
+        memset(&z, 0, sizeof z);
+        memset(&r, 0, sizeof r);
+        r.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        r.levelCount = 1;
+        r.layerCount = 1;
+        nvk_image_to(s_cmd, im, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        vkCmdClearColorImage(s_cmd, im->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &z, 1, &r);
+    }
+    return im;
+}
+
+/* The eye image of rt seen as the frame's sampling saw rt: through a view
+ * whose alpha reads 1 when the frame sampled rt's opaque view (rt_opaque). */
+static VkImageView st_eye_view(int eye, RenderTarget *rt, VkImageView recorded)
+{
+    int i = (int)(rt - s_rt);
+    struct nvk_image *im = st_eye_rt(eye, rt);
+    if (!im)
+        return VK_NULL_HANDLE;
+    if (!rt->opaque || recorded != rt->opaque)
+        return im->view;
+    if (!s_eye_opaque[eye][i]) {
+        VkImageViewCreateInfo vi;
+        memset(&vi, 0, sizeof vi);
+        vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        vi.image = im->img;
+        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vi.format = im->format;
+        vi.components.a = VK_COMPONENT_SWIZZLE_ONE;
+        vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        vi.subresourceRange.levelCount = 1;
+        vi.subresourceRange.layerCount = 1;
+        if (vkCreateImageView(s_dev, &vi, NULL, &s_eye_opaque[eye][i]) != VK_SUCCESS)
+            s_eye_opaque[eye][i] = VK_NULL_HANDLE;
+    }
+    return s_eye_opaque[eye][i] ? s_eye_opaque[eye][i] : im->view;
+}
+
+static struct nvk_image *st_eye_dt(int eye, DepthTarget *dt)
+{
+    int i = (int)(dt - s_dt);
+    struct nvk_image *im = &s_eye_dt[eye][i];
+    if (im->img && s_eye_dt_ident[eye][i] == dt->ident && im->w == st_sx(dt->hw)
+            && im->h == st_sy(dt->hh))
+        return im;
+    if (im->img)
+        garbage_push(im, VK_NULL_HANDLE, NULL);
+    memset(im, 0, sizeof *im);
+    if (!nvk_image_new(im, C->depth_format, st_sx(dt->hw), st_sy(dt->hh), 1,
+                       VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                       VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) {
+        memset(im, 0, sizeof *im);
+        return NULL;
+    }
+    s_eye_dt_ident[eye][i] = dt->ident;
+    {
+        VkClearDepthStencilValue z = { 1.0f, 0 };
+        VkImageSubresourceRange r;
+        memset(&r, 0, sizeof r);
+        r.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+        r.levelCount = 1;
+        r.layerCount = 1;
+        nvk_image_to(s_cmd, im, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        vkCmdClearDepthStencilImage(s_cmd, im->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &z, 1, &r);
+    }
+    return im;
+}
+
+/* A multisampled eye image (colour of rt, or depth of dt), cleared when new. */
+static struct nvk_image *st_eye_ms(struct nvk_image *im, uint32_t *ident, uint32_t want,
+                                   VkFormat f, uint32_t w, uint32_t h, int depth)
+{
+    if (im->img && *ident == want && im->w == w && im->h == h)
+        return im;
+    if (im->img)
+        garbage_push(im, VK_NULL_HANDLE, NULL);
+    memset(im, 0, sizeof *im);
+    if (!nvk_image_new_ms(im, f, w, h, (VkSampleCountFlagBits)s_st_samples,
+                          (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
+                                 : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                          depth ? VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT
+                                : VK_IMAGE_ASPECT_COLOR_BIT)) {
+        memset(im, 0, sizeof *im);
+        return NULL;
+    }
+    *ident = want;
+    {
+        VkImageSubresourceRange r;
+        memset(&r, 0, sizeof r);
+        r.levelCount = 1;
+        r.layerCount = 1;
+        nvk_image_to(s_cmd, im, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        if (depth) {
+            VkClearDepthStencilValue z = { 1.0f, 0 };
+            r.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+            vkCmdClearDepthStencilImage(s_cmd, im->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &z, 1, &r);
+        } else {
+            VkClearColorValue c;
+            memset(&c, 0, sizeof c);
+            r.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            vkCmdClearColorImage(s_cmd, im->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &c, 1, &r);
+        }
+    }
+    return im;
+}
+
+static void st_dyn_apply(const DynState *n, uint32_t vw, uint32_t vh, int scaled, VkPipeline pso)
+{
+    VkViewport vp;
+    VkRect2D sr = n->sr;
+    if (scaled) {
+        /* the frame's scissor in the eye's pixels */
+        uint32_t x1 = st_sx((uint32_t)n->sr.offset.x + n->sr.extent.width);
+        uint32_t y1 = st_sy((uint32_t)n->sr.offset.y + n->sr.extent.height);
+        sr.offset.x = (int32_t)st_sx((uint32_t)n->sr.offset.x);
+        sr.offset.y = (int32_t)st_sy((uint32_t)n->sr.offset.y);
+        sr.extent.width = x1 > (uint32_t)sr.offset.x ? x1 - (uint32_t)sr.offset.x : 1;
+        sr.extent.height = y1 > (uint32_t)sr.offset.y ? y1 - (uint32_t)sr.offset.y : 1;
+    }
+    vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pso ? pso : n->pso);
+    vkCmdSetDepthTestEnable(s_cmd, n->ztest);
+    vkCmdSetDepthWriteEnable(s_cmd, n->zwrite);
+    vkCmdSetDepthCompareOp(s_cmd, n->zcmp);
+    vkCmdSetStencilTestEnable(s_cmd, n->stest);
+    vkCmdSetStencilOp(s_cmd, VK_STENCIL_FACE_FRONT_AND_BACK, n->sop[0], n->sop[1], n->sop[2],
+                      n->scmp);
+    vkCmdSetStencilCompareMask(s_cmd, VK_STENCIL_FACE_FRONT_AND_BACK, n->srmask);
+    vkCmdSetStencilWriteMask(s_cmd, VK_STENCIL_FACE_FRONT_AND_BACK, n->swmask);
+    vkCmdSetStencilReference(s_cmd, VK_STENCIL_FACE_FRONT_AND_BACK, n->sref);
+    vkCmdSetDepthBiasEnable(s_cmd, n->slope != 0.0f ? VK_TRUE : VK_FALSE);
+    vkCmdSetDepthBias(s_cmd, 0.0f, 0.0f, n->slope);
+    vp.x = 0.0f;
+    vp.y = (float)vh;
+    vp.width = (float)vw;
+    vp.height = -(float)vh;
+    vp.minDepth = 0.0f;
+    vp.maxDepth = 1.0f;
+    vkCmdSetViewport(s_cmd, 0, 1, &vp);
+    vkCmdSetScissor(s_cmd, 0, 1, &sr);
+    vkCmdSetFrontFace(s_cmd, n->front);
+    vkCmdSetCullMode(s_cmd, n->cull);
+    vkCmdSetBlendConstants(s_cmd, n->bf);
+}
+
+static int bestn_valid(const float p[6])
+{
+    return p[0] != 0.0f && p[1] != 0.0f && p[5] != 0.0f;
+}
+
+static VkPipeline post_pso(const char *fs_src, const char *what);
+
+/* A fullscreen-triangle pass (s_hud_vs_glsl) into an RT_FORMAT target
+ * with fragment shader fs_src: the HUD solve, the eyes' FXAA. */
+static VkPipeline post_pso(const char *fs_src, const char *what)
+{
+    VkShaderModule vs, fs;
+    VkPipelineShaderStageCreateInfo ss[2];
+    VkPipelineVertexInputStateCreateInfo vi;
+    VkPipelineInputAssemblyStateCreateInfo ia;
+    VkPipelineViewportStateCreateInfo vp;
+    VkPipelineRasterizationStateCreateInfo rs;
+    VkPipelineMultisampleStateCreateInfo ms;
+    VkPipelineColorBlendAttachmentState cba;
+    VkPipelineColorBlendStateCreateInfo cb;
+    VkPipelineDynamicStateCreateInfo dy;
+    VkPipelineRenderingCreateInfo pr;
+    VkGraphicsPipelineCreateInfo gp;
+    static const VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkFormat cf = RT_FORMAT;
+    VkPipeline p = VK_NULL_HANDLE;
+
+    vs = module_from_glsl(NVK_STAGE_VERTEX, s_hud_vs_glsl, what);
+    fs = module_from_glsl(NVK_STAGE_FRAGMENT, fs_src, what);
+    if (vs && fs) {
+        memset(ss, 0, sizeof ss);
+        ss[0].sType = ss[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        ss[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+        ss[0].module = vs;
+        ss[0].pName = ss[1].pName = "main";
+        ss[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        ss[1].module = fs;
+        memset(&vi, 0, sizeof vi);
+        vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+        memset(&ia, 0, sizeof ia);
+        ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        memset(&vp, 0, sizeof vp);
+        vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+        vp.viewportCount = vp.scissorCount = 1;
+        memset(&rs, 0, sizeof rs);
+        rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+        rs.polygonMode = VK_POLYGON_MODE_FILL;
+        rs.cullMode = VK_CULL_MODE_NONE;
+        rs.lineWidth = 1.0f;
+        memset(&ms, 0, sizeof ms);
+        ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        memset(&cba, 0, sizeof cba);
+        cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
+                           | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        memset(&cb, 0, sizeof cb);
+        cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+        cb.attachmentCount = 1;
+        cb.pAttachments = &cba;
+        memset(&dy, 0, sizeof dy);
+        dy.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+        dy.dynamicStateCount = 2;
+        dy.pDynamicStates = dyn;
+        memset(&pr, 0, sizeof pr);
+        pr.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+        pr.colorAttachmentCount = 1;
+        pr.pColorAttachmentFormats = &cf;
+        memset(&gp, 0, sizeof gp);
+        gp.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        gp.pNext = &pr;
+        gp.stageCount = 2;
+        gp.pStages = ss;
+        gp.pVertexInputState = &vi;
+        gp.pInputAssemblyState = &ia;
+        gp.pViewportState = &vp;
+        gp.pRasterizationState = &rs;
+        gp.pMultisampleState = &ms;
+        gp.pColorBlendState = &cb;
+        gp.pDynamicState = &dy;
+        gp.layout = s_playout;
+        if (vkCreateGraphicsPipelines(s_dev, VK_NULL_HANDLE, 1, &gp, NULL, &p) != VK_SUCCESS)
+            p = VK_NULL_HANDLE;
+    }
+    if (vs)
+        vkDestroyShaderModule(s_dev, vs, NULL);
+    if (fs)
+        vkDestroyShaderModule(s_dev, fs, NULL);
+    return p;
+}
+
+static int fxaa_init(void)
+{
+    static int tried;
+    if (!tried) {
+        VkSamplerCreateInfo si;
+        tried = 1;
+        memset(&si, 0, sizeof si);
+        si.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        si.magFilter = si.minFilter = VK_FILTER_LINEAR;
+        si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        if (vkCreateSampler(s_dev, &si, NULL, &s_fxaa_smp) == VK_SUCCESS)
+            s_fxaa_pso = post_pso(s_fxaa_fs_glsl, "eye FXAA");
+        if (!s_fxaa_pso)
+            XR_ERROR(LOGP "stereo: the eyes' FXAA is unavailable\n");
+    }
+    return s_fxaa_pso != VK_NULL_HANDLE;
+}
+
+static int hud_init(void)
+{
+    VkSamplerCreateInfo si;
+
+    if (s_hud_tried)
+        return s_hud_pso != VK_NULL_HANDLE;
+    s_hud_tried = 1;
+    memset(&si, 0, sizeof si);
+    si.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    si.magFilter = si.minFilter = VK_FILTER_NEAREST;
+    si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    if (vkCreateSampler(s_dev, &si, NULL, &s_hud_smp) != VK_SUCCESS)
+        return 0;
+    s_hud_pso = post_pso(s_hud_fs_glsl, "HUD solve");
+    if (!s_hud_pso)
+        XR_ERROR(LOGP "stereo: the HUD solve pass is unavailable: frames with a HUD are shown flat\n");
+    return s_hud_pso != VK_NULL_HANDLE;
+}
+
+/* im as the presented target's colour image (format, size), new contents
+ * undefined; NULL when it cannot be made. */
+static struct nvk_image *hud_image(struct nvk_image *im, const struct nvk_image *like, VkFormat f,
+                                   VkImageUsageFlags usage, VkImageAspectFlags aspect)
+{
+    if (im->img && im->w == like->w && im->h == like->h && im->format == f)
+        return im;
+    if (im->img)
+        garbage_push(im, VK_NULL_HANDLE, NULL);
+    memset(im, 0, sizeof *im);
+    if (!nvk_image_new(im, f, like->w, like->h, 1, usage, aspect)) {
+        memset(im, 0, sizeof *im);
+        return NULL;
+    }
+    return im;
+}
+
+/* The HUD draws (ST_HUD) over black and over white, then solved into
+ * s_hud_im[2]; on s_cmd outside any pass. 1 when done. */
+static int hud_replay(RenderTarget *prt)
+{
+    int bg;
+    size_t i;
+    if (!hud_init())
+        return 0;
+    for (bg = 0; bg < 3; bg++)
+        if (!hud_image(&s_hud_im[bg], &prt->im, prt->im.format,
+                       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
+                       | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT))
+            return 0;
+    for (bg = 0; bg < 2; bg++) {
+        int open = 0, first = 1, inpass = 0, have_depth = 0;
+        uint32_t vw = 0, vh = 0;
+        eye_push_flat(s_cmd);
+        for (i = 0; i < s_st_n; i++) {
+            const StEv *e = &s_st_ev[i];
+            if (e->kind == EV_PASS) {
+                size_t j;
+                int any = 0;
+                struct nvk_image *zi = NULL;
+                VkRenderingAttachmentInfo ca, da;
+                VkRenderingInfo ri;
+                if (open) {
+                    vkCmdEndRendering(s_cmd);
+                    open = 0;
+                }
+                inpass = 0;
+                if (e->rt != prt)
+                    continue;
+                for (j = i + 1; j < s_st_n && s_st_ev[j].kind != EV_PASS; j++)
+                    if (s_st_ev[j].kind == EV_DRAW && (s_st_ev[j].flags & ST_HUD))
+                        any = 1;
+                if (!any)
+                    continue;
+                inpass = 1;
+                if (e->dt) {
+                    zi = hud_image(&s_hud_z, &e->dt->im, C->depth_format,
+                                   VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                                   VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
+                    if (!zi) {
+                        inpass = 0;
+                        continue;
+                    }
+                }
+                /* Textures the HUD draws read: readable before the pass. */
+                for (j = i + 1; j < s_st_n && s_st_ev[j].kind != EV_PASS; j++) {
+                    const StEv *d = &s_st_ev[j];
+                    int k;
+                    if (d->kind != EV_DRAW || !(d->flags & ST_HUD))
+                        continue;
+                    for (k = 0; k < 4; k++)
+                        if (d->src[k] && d->src[k] != d->rt)
+                            nvk_image_to(s_cmd, &d->src[k]->im, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                }
+                nvk_image_to(s_cmd, &s_hud_im[bg], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+                memset(&ca, 0, sizeof ca);
+                ca.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+                ca.imageView = s_hud_im[bg].view;
+                ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                ca.loadOp = first ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+                ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+                ca.clearValue.color.float32[0] = ca.clearValue.color.float32[1] =
+                    ca.clearValue.color.float32[2] = bg ? 1.0f : 0.0f;
+                ca.clearValue.color.float32[3] = bg ? 1.0f : 0.0f;
+                memset(&ri, 0, sizeof ri);
+                ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+                ri.renderArea.extent.width = e->hw;
+                ri.renderArea.extent.height = e->hh;
+                ri.layerCount = 1;
+                ri.colorAttachmentCount = 1;
+                ri.pColorAttachments = &ca;
+                have_depth = zi != NULL;
+                if (zi) {
+                    /* far and 0: the HUD sees no world */
+                    nvk_image_to(s_cmd, zi, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+                    memset(&da, 0, sizeof da);
+                    da.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+                    da.imageView = zi->view;
+                    da.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+                    da.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+                    da.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+                    da.clearValue.depthStencil.depth = 1.0f;
+                    ri.pDepthAttachment = &da;
+                    ri.pStencilAttachment = &da;
+                }
+                vkCmdBeginRendering(s_cmd, &ri);
+                open = 1;
+                first = 0;
+                vw = e->hw;
+                vh = e->hh;
+                continue;
+            }
+            if (!inpass || !open || e->kind != EV_DRAW || !(e->flags & ST_HUD))
+                continue;
+            (void)have_depth;
+            st_dyn_apply(&e->n, vw, vh, 0, VK_NULL_HANDLE);
+            vkCmdBindDescriptorSets(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_playout, 0, 1,
+                                    &s_set0, 3, e->dyn_off);
+            vkCmdBindDescriptorSets(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_playout, 1, 1,
+                                    &e->tset, 0, NULL);
+            vkCmdBindVertexBuffers(s_cmd, 0, 1, &s_ring[RING_VB].buf, &e->vb_off);
+            vkCmdBindIndexBuffer(s_cmd, s_ring[RING_IB].buf, e->ib_off, VK_INDEX_TYPE_UINT32);
+            vkCmdDrawIndexed(s_cmd, e->nidx, 1, 0, 0, 0);
+        }
+        if (open)
+            vkCmdEndRendering(s_cmd);
+        if (first) {
+            /* no HUD pass at all: nothing to show */
+            return 0;
+        }
+    }
+    {
+        /* solve */
+        VkImageView v[4];
+        VkSampler sm[4];
+        VkDescriptorSet set;
+        VkRenderingAttachmentInfo ca;
+        VkRenderingInfo ri;
+        VkViewport vp;
+        VkRect2D sc;
+        int k;
+        for (k = 0; k < 4; k++) {
+            v[k] = k < 2 ? s_hud_im[k].view : s_black.view;
+            sm[k] = s_hud_smp;
+        }
+        nvk_image_to(s_cmd, &s_hud_im[0], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        nvk_image_to(s_cmd, &s_hud_im[1], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        set = texture_set(v, sm);
+        if (!set)
+            return 0;
+        nvk_image_to(s_cmd, &s_hud_im[2], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        memset(&ca, 0, sizeof ca);
+        ca.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        ca.imageView = s_hud_im[2].view;
+        ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        ca.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        memset(&ri, 0, sizeof ri);
+        ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+        ri.renderArea.extent.width = s_hud_im[2].w;
+        ri.renderArea.extent.height = s_hud_im[2].h;
+        ri.layerCount = 1;
+        ri.colorAttachmentCount = 1;
+        ri.pColorAttachments = &ca;
+        vkCmdBeginRendering(s_cmd, &ri);
+        vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_hud_pso);
+        vp.x = 0.0f;
+        vp.y = 0.0f;
+        vp.width = (float)s_hud_im[2].w;
+        vp.height = (float)s_hud_im[2].h;
+        vp.minDepth = 0.0f;
+        vp.maxDepth = 1.0f;
+        vkCmdSetViewport(s_cmd, 0, 1, &vp);
+        sc.offset.x = sc.offset.y = 0;
+        sc.extent.width = s_hud_im[2].w;
+        sc.extent.height = s_hud_im[2].h;
+        vkCmdSetScissor(s_cmd, 0, 1, &sc);
+        vkCmdBindDescriptorSets(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_playout, 1, 1, &set, 0, NULL);
+        vkCmdDraw(s_cmd, 3, 1, 0, 0);
+        vkCmdEndRendering(s_cmd);
+    }
+    s_dyn_valid = 0;
+    s_st_hud_frames++;
+    return 1;
+}
+
+/* An image (cw x ch from its corner) into a headset slot image, GENERAL. */
+static void st_copy_out(struct nvk_image *src, struct nvk_image *dst, uint32_t cw, uint32_t ch)
+{
+    VkImageCopy ic;
+    nvk_image_to(s_cmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    nvk_image_barrier(s_cmd, dst->img, VK_IMAGE_ASPECT_COLOR_BIT,
+                      dst->layout == VK_IMAGE_LAYOUT_UNDEFINED
+                      ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL,
+                      VK_IMAGE_LAYOUT_GENERAL);
+    dst->layout = VK_IMAGE_LAYOUT_GENERAL;
+    memset(&ic, 0, sizeof ic);
+    ic.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    ic.srcSubresource.layerCount = 1;
+    ic.dstSubresource = ic.srcSubresource;
+    ic.extent.width = cw;
+    ic.extent.height = ch;
+    ic.extent.depth = 1;
+    vkCmdCopyImage(s_cmd, src->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst->img,
+                   VK_IMAGE_LAYOUT_GENERAL, 1, &ic);
+}
+
+/* The picture drawn for each eye into its eye images, and the presented
+ * target's eye images copied (cw x ch host pixels) into out[eye] (GENERAL).
+ * Records on s_cmd, outside any pass, after the frame's draws. 1 when the
+ * eyes were drawn; 0 when the frame has no stereo (no world draws in the
+ * picture, a spoilt recording, no eye views yet). */
+static int stereo_replay(RenderTarget *prt, uint32_t cw, uint32_t ch,
+                         struct nvk_image *out[2], const nvkxr_eye head_eyes[2], float scale,
+                         struct nvk_image *hud_out, int cinema)
+{
+    nvkxr_eye eyes[2];
+    float best[6] = { 0 }, best_vp[4] = { 0 };
+    uint32_t pic = 0, prev;
+    size_t i;
+    int eye, round, nworld = 0, said_m = (s_st_frames % 600) != 0, cur_ms = 0;
+    uint32_t ms_mask = 0, seen = 0, seen_d = 0;
+    RenderTarget *cur_rt = NULL;
+    DepthTarget *cur_dt = NULL;
+    struct nvk_image *mci = NULL;
+    static int said, test = -1;
+
+    if (test < 0) {
+        const char *t = getenv("RECOMP_XR_STEREO_TEST");
+        test = t ? atoi(t) : 0;
+    }
+
+    if (s_st_bad || !s_st_n || !prt) {
+        if (s_st_bad)
+            s_st_spoilt++;
+        return 0;
+    }
+    /* Every target and depth buffer still the one recorded? */
+    for (i = 0; i < s_st_n; i++) {
+        const StEv *e = &s_st_ev[i];
+        int k;
+        if (e->rt && (e->rt->ident != e->rt_ident || !e->rt->im.img))
+            return 0;
+        if (e->kind == EV_PASS && e->dt && e->dt->ident != e->dt_ident)
+            return 0;
+        for (k = 0; e->kind == EV_DRAW && k < 4; k++)
+            if (e->src[k] && e->src[k]->ident != e->src_ident[k])
+                return 0;
+    }
+    /* Membership. */
+    pic = 1u << (prt - s_rt);
+    for (round = 0; round < 16; round++) {
+        prev = pic;
+        for (i = 0; i < s_st_n; i++) {
+            const StEv *e = &s_st_ev[i];
+            uint32_t d;
+            int k;
+            if (e->kind != EV_DRAW)
+                continue;
+            d = 1u << (e->rt - s_rt);
+            for (k = 0; k < 4; k++) {
+                const RenderTarget *src = e->src[k];
+                uint32_t sb;
+                if (!src || src == e->rt)
+                    continue;
+                sb = 1u << (src - s_rt);
+                if ((pic & d) && st_shaped(src, prt))
+                    pic |= sb;
+                if ((pic & sb) && st_shaped(e->rt, prt))
+                    pic |= d;
+            }
+        }
+        if (pic == prev)
+            break;
+    }
+    for (i = 0; i < s_st_n; i++)
+        if (s_st_ev[i].kind == EV_DRAW && (s_st_ev[i].flags & ST_WORLD)
+                && (pic & (1u << (s_st_ev[i].rt - s_rt))))
+            nworld++;
+    if (!nworld) {
+        s_st_none++;
+        return 0;
+    }
+    eyes[0] = head_eyes[0];
+    eyes[1] = head_eyes[1];
+    {
+        /* The projection most of the picture's own world draws use (the
+         * game camera's), and its viewport, for draws whose own cannot be
+         * read: one pass, a count per distinct projection (16 kept). */
+        struct { float proj[6], vp[4]; int n; } h[16];
+        int nh = 0, b = -1, k;
+        for (i = 0; i < s_st_n; i++) {
+            const StEv *e = &s_st_ev[i];
+            if (e->kind != EV_DRAW || !(e->flags & ST_WORLD) || !(pic & (1u << (e->rt - s_rt))))
+                continue;
+            for (k = 0; k < nh && memcmp(h[k].proj, e->proj, sizeof e->proj); k++)
+                ;
+            if (k == nh) {
+                if (nh == 16)
+                    continue;
+                memcpy(h[k].proj, e->proj, sizeof e->proj);
+                memcpy(h[k].vp, e->vp, sizeof e->vp);
+                h[k].n = 0;
+                nh++;
+            }
+            if (++h[k].n > (b >= 0 ? h[b].n : 0))
+                b = k;
+        }
+        if (b >= 0) {
+            memcpy(best, h[b].proj, sizeof best);
+            memcpy(best_vp, h[b].vp, sizeof best_vp);
+        }
+    }
+    if (cinema) {
+        /* The 3D cinema (the title's own cameras: fly-by, crash cameras,
+         * pauses): fixed eyes 64 mm apart at the game camera, framed as its
+         * own picture (the projection most of the picture's world draws
+         * use), converging at RECOMP_XR_CINEMA_DEPTH game units (6); the
+         * HUD stays in the picture. */
+        static float depth = -1.0f;
+        int e2;
+        if (depth < 0.0f) {
+            const char *dv = getenv("RECOMP_XR_CINEMA_DEPTH");
+            depth = dv && atof(dv) > 0.0 ? (float)atof(dv) : 6.0f;
+        }
+        for (e2 = 0; e2 < 2; e2++) {
+            float ex = e2 ? 0.032f : -0.032f, sh = ex / (depth / scale);
+            memset(&eyes[e2], 0, sizeof eyes[e2]);
+            eyes[e2].pos[0] = ex;
+            eyes[e2].quat[3] = 1.0f;
+            eyes[e2].tan[0] = (-1.0f - best[2]) / best[0] - sh;
+            eyes[e2].tan[1] = (1.0f - best[2]) / best[0] - sh;
+            eyes[e2].tan[2] = (1.0f - best[3]) / best[1];
+            eyes[e2].tan[3] = (-1.0f - best[3]) / best[1];
+        }
+        hud_out = NULL;
+    }
+    /* The HUD: after the composite (the presented target's first draw that
+     * reads another picture target), its draws that are not world and read
+     * no picture target. */
+    if (hud_out) {
+        int composited = 0;
+        for (i = 0; i < s_st_n; i++) {
+            StEv *e = &s_st_ev[i];
+            int k, reads = 0;
+            if (e->kind != EV_DRAW || e->rt != prt)
+                continue;
+            for (k = 0; k < 4; k++)
+                if (e->src[k] && e->src[k] != prt && (pic & (1u << (e->src[k] - s_rt))))
+                    reads = 1;
+            if (reads)
+                composited = 1;
+            else if (composited && !(e->flags & (ST_WORLD | ST_BAR | ST_FULL)))
+                e->flags |= ST_HUD;
+        }
+    }
+    {
+        /* Draws in the picture with no projection of their own: a program
+         * whose rows cannot be read (wheels, skinned parts) takes the last
+         * world draw's before it; screen positions (billboards, glows,
+         * particles) are rebuilt in 3D with it. Not what reads the picture
+         * (composite, bloom, blur): that stays as drawn. */
+        const float *last = NULL, *last_vp = NULL;
+        for (i = 0; i < s_st_n; i++) {
+            StEv *e = &s_st_ev[i];
+            int k, reads = 0;
+            if (e->kind != EV_DRAW || !(pic & (1u << (e->rt - s_rt))))
+                continue;
+            if (e->flags & ST_WORLD) {
+                last = e->proj;
+                last_vp = e->camvp;
+                continue;
+            }
+            if (e->flags & (ST_HUD | ST_BAR | ST_FULL))
+                continue;
+            for (k = 0; k < 4; k++)
+                if (e->src[k] && e->src[k] != e->rt && (pic & (1u << (e->src[k] - s_rt))))
+                    reads = 1;
+            if (reads && !cinema && (e->flags & ST_SCREEN) && e->rt == prt
+                    && e->box[0] <= 0.02f * (float)prt->w && e->box[2] >= 0.98f * (float)prt->w
+                    && (e->box[1] > 1.0f || e->box[3] < (float)prt->h - 1.0f)
+                    && e->box[3] - e->box[1] > 0.5f * (float)prt->h) {
+                /* The title's composite of its full-frame scene into the
+                 * rows inside its letterbox (rows 16..464 in a race, more in
+                 * the crash cameras): the eye's scene is exact over the
+                 * whole frame, so the eyes draw it over the whole frame. */
+                e->flags |= ST_STRETCH;
+                continue;
+            }
+            if (reads || !bestn_valid(best))
+                continue;
+            memcpy(e->proj, last ? last : best, sizeof e->proj);
+            memcpy(e->camvp, last ? last_vp : best_vp, sizeof e->camvp);
+            if (e->flags & ST_CAPT) {
+                e->flags |= ST_WORLD;
+                s_st_borrow++;
+            } else if (e->flags & ST_SCREEN) {
+                e->flags |= ST_REPROJ;
+                s_st_reproj++;
+            }
+        }
+    }
+    if (said < 4 || vk_trace()) {
+        int k, n = 0;
+        char list[256];
+        list[0] = 0;
+        for (k = 0; k < RT_MAX; k++)
+            if (pic & (1u << k))
+                n += snprintf(list + n, sizeof list - (size_t)n, " %ux%u@%08X", s_rt[k].w,
+                              s_rt[k].h, s_rt[k].offset), n = n < (int)sizeof list ? n : (int)sizeof list - 1;
+        fprintf(stderr, LOGP "stereo: picture targets%s; %d world draws of %zu events\n", list,
+                nworld, s_st_n);
+        said++;
+    }
+    {
+        /* RECOMP_XR_STEREO_LOG=n: every n-th stereo frame, the picture's
+         * passes and draws as classified (for finding what is what). */
+        static int every = -1;
+        if (every < 0) {
+            const char *lv = getenv("RECOMP_XR_STEREO_LOG");
+            every = lv ? atoi(lv) : 0;
+        }
+        int want = every > 0 && (s_st_frames % (uint64_t)every) == 0;
+        static int barlike_logged;
+        if (every == -1 && barlike_logged < 6) {
+            /* =-1: only frames with a wide, short 2D draw (a bar's shape) */
+            for (i = 0; i < s_st_n && !want; i++) {
+                const StEv *e = &s_st_ev[i];
+                if (e->kind == EV_DRAW && e->rt && e->box[2] - e->box[0] >= 0.9f * (float)e->rt->w
+                        && e->box[3] - e->box[1] > 0.0f && e->box[3] - e->box[1] <= 0.35f * (float)e->rt->h)
+                    want = 1;
+            }
+            barlike_logged += want;
+        }
+        if (every == -2 && !cinema && barlike_logged < 4) {
+            /* =-2: immersive frames whose composite was not stretched */
+            int stretched = 0;
+            for (i = 0; i < s_st_n; i++)
+                if (s_st_ev[i].kind == EV_DRAW && (s_st_ev[i].flags & ST_STRETCH))
+                    stretched = 1;
+            want = !stretched;
+            barlike_logged += want;
+        }
+        if (want) {
+            fprintf(stderr, LOGP "stereo log: frame %llu, %zu events, cinema %d\n",
+                    (unsigned long long)s_st_frames, s_st_n, cinema);
+            for (i = 0; i < s_st_n; i++) {
+                const StEv *e = &s_st_ev[i];
+                int inpic = e->rt && (pic & (1u << (e->rt - s_rt)));
+                if (e->kind == EV_PASS)
+                    fprintf(stderr, LOGP "  %zu pass %ux%u@%08X%s clear %d z %d\n", i, e->rt->w, e->rt->h,
+                            e->rt->offset, inpic ? " (picture)" : "", e->clear, e->dt != NULL);
+                else if (e->kind != EV_DRAW)
+                    fprintf(stderr, LOGP "  %zu %s clear rect %d,%d %ux%u\n", i,
+                            e->kind == EV_ZCLEAR ? "depth" : "colour", e->cr.rect.offset.x,
+                            e->cr.rect.offset.y, e->cr.rect.extent.width, e->cr.rect.extent.height);
+                else if (inpic)
+                    fprintf(stderr, LOGP "  %zu draw%s%s%s%s%s%s%s n %u ztest %d zwrite %d box %.0f,%.0f..%.0f,%.0f"
+                            " uv %.3f,%.3f..%.3f,%.3f vp %.0f %.0f %.1f %.1f scissor %d,%d %ux%u proj %.3f %.3f\n", i,
+                            (e->flags & ST_WORLD) ? " world" : "", (e->flags & ST_HUD) ? " hud" : "",
+                            (e->flags & ST_CAPT) ? " capt" : "", (e->flags & ST_SCREEN) ? " screen" : "",
+                            (e->flags & ST_BAR) ? " bar" : "", (e->flags & ST_REPROJ) ? " reproj" : "",
+                            (e->flags & ST_FULL) ? " full" : (e->flags & ST_STRETCH) ? " stretch" : "", e->nidx, e->n.ztest, e->n.zwrite,
+                            e->box[0], e->box[1], e->box[2], e->box[3], e->uv[0], e->uv[1], e->uv[2],
+                            e->uv[3], e->vp[0], e->vp[1], e->vp[2],
+                            e->vp[3], e->n.sr.offset.x, e->n.sr.offset.y, e->n.sr.extent.width,
+                            e->n.sr.extent.height, e->proj[0], e->proj[1]);
+            }
+        }
+    }
+    if (!s_st_samples) {
+        /* RECOMP_XR_MSAA: the eyes' scene multisampled (1: off, the default;
+         * 2 cost 2.5-4 ms of GPU at 2160x2160 on the Frame and missed
+         * refreshes), within what the device takes for colour and depth */
+        const char *mv = getenv("RECOMP_XR_MSAA");
+        VkSampleCountFlags ok = C->props.limits.framebufferColorSampleCounts
+                                & C->props.limits.framebufferDepthSampleCounts;
+        s_st_samples = mv && *mv ? (uint32_t)atoi(mv) : 1;
+        while (s_st_samples > 1 && !(ok & s_st_samples))
+            s_st_samples >>= 1;
+        if (s_st_samples < 1)
+            s_st_samples = 1;
+        fprintf(stderr, LOGP "stereo: eyes' scene at %ux MSAA\n", s_st_samples);
+    }
+    for (i = 0; i < s_st_n; i++)
+        if (s_st_ev[i].kind == EV_PASS && s_st_ev[i].dt && (pic & (1u << (s_st_ev[i].rt - s_rt))))
+            ms_mask |= 1u << (s_st_ev[i].rt - s_rt);
+    end_encoder();
+    ensure_cmd();
+    for (eye = 0; eye < 2; eye++) {
+        float efg[16];
+        int open = 0, inpass = 0;
+        uint32_t vw = 0, vh = 0, mode = 0;
+        int have_depth = 0;
+        eye_from_game(&eyes[eye], scale, efg);
+        eye_push_flat(s_cmd);
+        seen = 0;
+        seen_d = 0;
+        cur_rt = NULL;
+        cur_dt = NULL;
+        for (i = 0; i < s_st_n; i++) {
+            const StEv *e = &s_st_ev[i];
+            if (e->kind == EV_PASS) {
+                size_t j;
+                struct nvk_image *ci, *di = NULL;
+                VkRenderingAttachmentInfo ca, da, sa;
+                VkRenderingInfo ri;
+                uint32_t tb = e->rt ? 1u << (e->rt - s_rt) : 0;
+                int first, later = 0, dfirst, dlater = 0;
+                if (!(pic & tb)) {
+                    /* a pass on a target the eyes do not draw: its draws
+                     * are skipped; the eye's own pass stays open */
+                    inpass = 0;
+                    continue;
+                }
+                if (open && cur_rt == e->rt && cur_dt == e->dt) {
+                    /* The same target again (the title ended its pass for
+                     * work elsewhere): one pass for the eye, the new pass's
+                     * clears made inside it. */
+                    VkClearAttachment cl;
+                    VkClearRect cr;
+                    inpass = 1;
+                    memset(&cr, 0, sizeof cr);
+                    cr.rect.extent.width = vw;
+                    cr.rect.extent.height = vh;
+                    cr.layerCount = 1;
+                    if (e->clear) {
+                        memset(&cl, 0, sizeof cl);
+                        cl.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                        memcpy(cl.clearValue.color.float32, e->c, 16);
+                        vkCmdClearAttachments(s_cmd, 1, &cl, 1, &cr);
+                    }
+                    if (have_depth && (e->zc || e->sc)) {
+                        memset(&cl, 0, sizeof cl);
+                        cl.aspectMask = (e->zc ? VK_IMAGE_ASPECT_DEPTH_BIT : 0)
+                                      | (e->sc ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
+                        cl.clearValue.depthStencil.depth = e->z;
+                        cl.clearValue.depthStencil.stencil = e->st;
+                        vkCmdClearAttachments(s_cmd, 1, &cl, 1, &cr);
+                    }
+                    continue;
+                }
+                if (open) {
+                    vkCmdEndRendering(s_cmd);
+                    open = 0;
+                }
+                inpass = 1;
+                ci = st_eye_rt(eye, e->rt);
+                cur_ms = s_st_samples > 1 && (ms_mask & tb);
+                mci = NULL;
+                if (ci && cur_ms) {
+                    int ri2 = (int)(e->rt - s_rt);
+                    mci = st_eye_ms(&s_eye_ms[eye][ri2], &s_eye_ms_ident[eye][ri2], e->rt->ident,
+                                    ci->format, ci->w, ci->h, 0);
+                    if (!mci)
+                        cur_ms = 0;
+                }
+                if (e->dt) {
+                    if (cur_ms) {
+                        int di2 = (int)(e->dt - s_dt);
+                        di = st_eye_ms(&s_eye_dms[eye][di2], &s_eye_dms_ident[eye][di2], e->dt->ident,
+                                       C->depth_format, st_sx(e->dt->hw), st_sy(e->dt->hh), 1);
+                    } else {
+                        di = st_eye_dt(eye, e->dt);
+                    }
+                }
+                if (!ci || (e->dt && !di)) {
+                    inpass = 0;
+                    continue;
+                }
+                /* The span this eye pass covers: up to a pass on another
+                 * picture target. What its draws sample is made readable
+                 * before it opens; whether the target is drawn again after
+                 * it decides whether a multisampled image must be kept. */
+                for (j = i + 1; j < s_st_n; j++) {
+                    const StEv *d = &s_st_ev[j];
+                    int k;
+                    if (d->kind == EV_PASS) {
+                        if ((pic & (1u << (d->rt - s_rt))) && (d->rt != e->rt || d->dt != e->dt))
+                            break;
+                        continue;
+                    }
+                    if (d->kind != EV_DRAW || d->rt != e->rt)
+                        continue;
+                    for (k = 0; k < 4; k++) {
+                        RenderTarget *src = d->src[k];
+                        if (!src || src == d->rt)
+                            continue;
+                        if (pic & (1u << (src - s_rt))) {
+                            struct nvk_image *si = st_eye_rt(eye, src);
+                            if (si)
+                                nvk_image_to(s_cmd, si, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                        } else {
+                            nvk_image_to(s_cmd, &src->im, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                        }
+                    }
+                }
+                for (; j < s_st_n; j++) {
+                    if (s_st_ev[j].kind != EV_PASS)
+                        continue;
+                    if (s_st_ev[j].rt == e->rt)
+                        later = 1;
+                    if (e->dt && s_st_ev[j].dt == e->dt)
+                        dlater = 1;
+                }
+                first = !(seen & tb);
+                seen |= tb;
+                /* a depth buffer may be shared between colour targets: its
+                 * own first and last pass decide */
+                dfirst = e->dt && !(seen_d & (1u << (e->dt - s_dt)));
+                if (e->dt)
+                    seen_d |= 1u << (e->dt - s_dt);
+                nvk_image_to(s_cmd, ci, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+                memset(&ca, 0, sizeof ca);
+                ca.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+                ca.imageView = ci->view;
+                ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                ca.loadOp = e->clear ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+                ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+                if (e->clear)
+                    memcpy(ca.clearValue.color.float32, e->c, 16);
+                if (cur_ms) {
+                    /* Drawn multisampled and resolved into the eye image.
+                     * The multisampled image lives only through the frame:
+                     * cleared at its first pass (what the title did not
+                     * cover reads black, not the frame before), not kept
+                     * after its last. */
+                    nvk_image_to(s_cmd, mci, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+                    ca.imageView = mci->view;
+                    ca.resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT;
+                    ca.resolveImageView = ci->view;
+                    ca.resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                    if (first)
+                        ca.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+                    if (!later)
+                        ca.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+                }
+                memset(&ri, 0, sizeof ri);
+                ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+                ri.renderArea.extent.width = ci->w;
+                ri.renderArea.extent.height = ci->h;
+                ri.layerCount = 1;
+                ri.colorAttachmentCount = 1;
+                ri.pColorAttachments = &ca;
+                have_depth = di != NULL;
+                if (di) {
+                    nvk_image_to(s_cmd, di, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+                    memset(&da, 0, sizeof da);
+                    da.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+                    da.imageView = di->view;
+                    da.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+                    da.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+                    sa = da;
+                    da.loadOp = e->zc ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+                    da.clearValue.depthStencil.depth = e->zc ? e->z : 1.0f;
+                    sa.loadOp = e->sc ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+                    sa.clearValue.depthStencil.stencil = e->sc ? e->st : 0;
+                    if (cur_ms) {
+                        if (dfirst)
+                            da.loadOp = sa.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+                        if (!dlater)
+                            da.storeOp = sa.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+                    }
+                    ri.pDepthAttachment = &da;
+                    ri.pStencilAttachment = &sa;
+                }
+                vkCmdBeginRendering(s_cmd, &ri);
+                open = 1;
+                cur_rt = e->rt;
+                cur_dt = e->dt;
+                vw = ci->w;
+                vh = ci->h;
+                continue;
+            }
+            if (!inpass || !open)
+                continue;
+            if (e->kind == EV_CCLEAR || (e->kind == EV_ZCLEAR && have_depth)) {
+                VkClearRect cr = e->cr;
+                uint32_t x1 = st_sx((uint32_t)e->cr.rect.offset.x + e->cr.rect.extent.width);
+                uint32_t y1 = st_sy((uint32_t)e->cr.rect.offset.y + e->cr.rect.extent.height);
+                cr.rect.offset.x = (int32_t)st_sx((uint32_t)e->cr.rect.offset.x);
+                cr.rect.offset.y = (int32_t)st_sy((uint32_t)e->cr.rect.offset.y);
+                if (x1 > vw) x1 = vw;
+                if (y1 > vh) y1 = vh;
+                if (x1 <= (uint32_t)cr.rect.offset.x || y1 <= (uint32_t)cr.rect.offset.y)
+                    continue;
+                cr.rect.extent.width = x1 - (uint32_t)cr.rect.offset.x;
+                cr.rect.extent.height = y1 - (uint32_t)cr.rect.offset.y;
+                vkCmdClearAttachments(s_cmd, 1, &e->ca, 1, &cr);
+                continue;
+            }
+            if (e->kind != EV_DRAW || (e->flags & ST_HUD))
+                continue;
+            if ((e->flags & ST_BAR) && !cinema) {
+                s_st_bars += eye == 0;
+                continue;
+            }
+            {
+                VkDescriptorSet tset = e->tset;
+                VkImageView views[4];
+                int k, routed = 0;
+                for (k = 0; k < 4; k++) {
+                    RenderTarget *src = e->src[k];
+                    views[k] = e->sview[k];
+                    if (src && src != e->rt && (pic & (1u << (src - s_rt)))) {
+                        VkImageView ev = st_eye_view(eye, src, e->sview[k]);
+                        if (ev) {
+                            views[k] = ev;
+                            routed = 1;
+                        }
+                    }
+                }
+                if (routed) {
+                    tset = texture_set(views, e->ssmp);
+                    if (!tset)
+                        continue;
+                }
+                {
+                    VkPipeline mp = cur_ms ? pipeline_ms(&e->key, s_st_samples) : VK_NULL_HANDLE;
+                    if (cur_ms && !mp)
+                        continue;
+                    st_dyn_apply(&e->n, vw, vh, 1, mp);
+                }
+                if (e->flags & ST_STRETCH) {
+                    /* rows box[1]..box[3] of the frame onto all of the eye's */
+                    float gh = (float)e->rt->h, k = gh / (e->box[3] - e->box[1]);
+                    float top = -e->box[1] * k * (float)vh / gh, height = (float)vh * k;
+                    VkViewport svp;
+                    VkRect2D ssr;
+                    svp.x = 0.0f;
+                    svp.width = (float)vw;
+                    svp.y = top + height;
+                    svp.height = -height;
+                    svp.minDepth = 0.0f;
+                    svp.maxDepth = 1.0f;
+                    vkCmdSetViewport(s_cmd, 0, 1, &svp);
+                    ssr.offset.x = ssr.offset.y = 0;
+                    ssr.extent.width = vw;
+                    ssr.extent.height = vh;
+                    vkCmdSetScissor(s_cmd, 0, 1, &ssr);
+                    s_st_stretch += eye == 0;
+                }
+                if (e->flags & (ST_WORLD | ST_REPROJ)) {
+                    float pc[D3D8_GLSL_EYE_BYTES / 4];
+                    uint32_t one = (e->flags & ST_WORLD) ? 1 : 2;
+                    eye_clip_transform(efg, eyes[eye].tan, scale, e->proj, pc);
+                    if (test) {
+                        /* RECOMP_XR_STEREO_TEST: 1 identity (the eyes are the
+                         * flat picture), 2 half size about the centre */
+                        memset(pc, 0, 64);
+                        pc[0] = pc[5] = test == 2 ? 0.5f : 1.0f;
+                        pc[10] = pc[15] = 1.0f;
+                    }
+                    if (!said_m && eye == 0) {
+                        said_m = 1;
+                        fprintf(stderr, LOGP "stereo: eye 0 tangents %.4f %.4f %.4f %.4f at %.4f %.4f %.4f,"
+                                " projection %.4f %.4f; m rows %.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f |"
+                                " %.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f\n", eyes[0].tan[0],
+                                eyes[0].tan[1], eyes[0].tan[2], eyes[0].tan[3], eyes[0].pos[0],
+                                eyes[0].pos[1], eyes[0].pos[2], e->proj[0], e->proj[1],
+                                pc[0], pc[4], pc[8], pc[12], pc[1], pc[5], pc[9], pc[13],
+                                pc[2], pc[6], pc[10], pc[14], pc[3], pc[7], pc[11], pc[15]);
+                    }
+                    memset(&pc[16], 0, D3D8_GLSL_EYE_BYTES - 64);
+                    memcpy(&pc[16], &one, 4);
+                    pc[20] = e->proj[4];    /* Q, Z0: D3D8_GLSL_EYE_REPROJECT */
+                    pc[21] = e->proj[5];
+                    memcpy(&pc[24], e->camvp, 16);   /* the camera's viewport */
+                    vkCmdPushConstants(s_cmd, s_playout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof pc, pc);
+                    mode = 1;
+                    s_st_world++;
+                } else if (mode) {
+                    eye_push_flat(s_cmd);
+                    mode = 0;
+                }
+                vkCmdBindDescriptorSets(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_playout, 0, 1,
+                                        &s_set0, 3, e->dyn_off);
+                vkCmdBindDescriptorSets(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_playout, 1, 1,
+                                        &tset, 0, NULL);
+                vkCmdBindVertexBuffers(s_cmd, 0, 1, &s_ring[RING_VB].buf, &e->vb_off);
+                vkCmdBindIndexBuffer(s_cmd, s_ring[RING_IB].buf, e->ib_off, VK_INDEX_TYPE_UINT32);
+                vkCmdDrawIndexed(s_cmd, e->nidx, 1, 0, 0, 0);
+                s_st_draws++;
+            }
+        }
+        if (open)
+            vkCmdEndRendering(s_cmd);
+        if (mode)
+            eye_push_flat(s_cmd);
+        /* The eye's picture to the headset's slot. */
+        {
+            struct nvk_image *pi = st_eye_rt(eye, prt);
+            static int fxaa = -1;
+            if (!pi)
+                return 0;
+            if (fxaa < 0) {
+                const char *fv = getenv("RECOMP_XR_FXAA");
+                fxaa = !(fv && *fv == '0');
+            }
+            if (fxaa && fxaa_init()
+                    && hud_image(&s_eye_post[eye], pi, pi->format,
+                                 VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                                 VK_IMAGE_ASPECT_COLOR_BIT)) {
+                /* FXAA over the eye's picture into its post image */
+                struct nvk_image *po = &s_eye_post[eye];
+                VkImageView v[4];
+                VkSampler sm[4];
+                VkDescriptorSet set;
+                int k;
+                for (k = 0; k < 4; k++) {
+                    v[k] = k ? s_black.view : pi->view;
+                    sm[k] = s_fxaa_smp;
+                }
+                nvk_image_to(s_cmd, pi, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                set = texture_set(v, sm);
+                if (set) {
+                    VkRenderingAttachmentInfo ca;
+                    VkRenderingInfo ri;
+                    VkViewport vp;
+                    VkRect2D sc;
+                    nvk_image_to(s_cmd, po, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+                    memset(&ca, 0, sizeof ca);
+                    ca.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+                    ca.imageView = po->view;
+                    ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                    ca.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+                    ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+                    memset(&ri, 0, sizeof ri);
+                    ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+                    ri.renderArea.extent.width = po->w;
+                    ri.renderArea.extent.height = po->h;
+                    ri.layerCount = 1;
+                    ri.colorAttachmentCount = 1;
+                    ri.pColorAttachments = &ca;
+                    vkCmdBeginRendering(s_cmd, &ri);
+                    vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_fxaa_pso);
+                    vp.x = vp.y = 0.0f;
+                    vp.width = (float)po->w;
+                    vp.height = (float)po->h;
+                    vp.minDepth = 0.0f;
+                    vp.maxDepth = 1.0f;
+                    vkCmdSetViewport(s_cmd, 0, 1, &vp);
+                    sc.offset.x = sc.offset.y = 0;
+                    sc.extent.width = po->w;
+                    sc.extent.height = po->h;
+                    vkCmdSetScissor(s_cmd, 0, 1, &sc);
+                    vkCmdBindDescriptorSets(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_playout, 1, 1,
+                                            &set, 0, NULL);
+                    vkCmdDraw(s_cmd, 3, 1, 0, 0);
+                    vkCmdEndRendering(s_cmd);
+                    pi = po;
+                }
+            }
+            st_copy_out(pi, out[eye], out[eye]->w < pi->w ? out[eye]->w : pi->w,
+                        out[eye]->h < pi->h ? out[eye]->h : pi->h);
+        }
+        /* Each eye to the GPU as it is recorded: the compositor, which
+         * shares the GPU at the headset's rate, gets in between. */
+        flush(0, FL_BATCH);
+        ensure_cmd();
+    }
+    s_dyn_valid = 0;
+    s_st_frames++;
+    if (cinema)
+        return NVKXR_EYES | NVKXR_CINEMA;
+    if (hud_out) {
+        int nhud = 0;
+        for (i = 0; i < s_st_n; i++)
+            nhud += s_st_ev[i].kind == EV_DRAW && (s_st_ev[i].flags & ST_HUD);
+        if (hud_replay(prt)) {
+            st_copy_out(&s_hud_im[2], hud_out, cw, ch);
+            return NVKXR_EYES | NVKXR_HUD;
+        }
+        /* The HUD was left out of the eyes and could not be drawn on its
+         * own: the frame goes flat rather than without its HUD. */
+        if (nhud)
+            return 0;
+    }
+    return NVKXR_EYES;
+}
+#endif
 
 /* ---- flip ---------------------------------------------------------------------- */
 
@@ -5546,6 +7407,7 @@ static void pc_warm_item(PcJob *J, size_t i, NV2AVshProgram *parsed, char *glsl)
         uint16_t inputs = 0;
         VkShaderModule mod;
         VsEntry *e;
+        D3D8VshStereo st;
         handled = 1;
         for (k = 0; k < len / 4u; k++)      /* nv2a_vsh_program_hash */
             hash = (hash ^ ((const uint32_t *)d)[k]) * 16777619u;
@@ -5555,10 +7417,10 @@ static void pc_warm_item(PcJob *J, size_t i, NV2AVshProgram *parsed, char *glsl)
         e = vs_find(hash);
         pthread_mutex_unlock(&s_pc_mu);
         if (e || !(mod = vs_build((const uint32_t *)d, (int)(len / 16u), hash, &inputs, parsed,
-                                  glsl, 1)))
+                                  glsl, 1, &st)))
             goto out;
         pthread_mutex_lock(&s_pc_mu);
-        if (vs_find(hash) || !vs_take(hash, vs_kid(d, len), mod, inputs))
+        if (vs_find(hash) || !vs_take(hash, vs_kid(d, len), mod, inputs, &st))
             e = NULL;                   /* the ack thread was first, or the table is full */
         else
             e = s_vs, __atomic_fetch_add(&J->nb[PC_VS], 1, __ATOMIC_RELAXED);
@@ -6103,6 +7965,14 @@ static int init(void)
     pl.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     pl.setLayoutCount = 2;
     pl.pSetLayouts = s_dsl;
+    {
+        /* D3D8_GLSL_EYE: a stereo program's eye transform */
+        static VkPushConstantRange eye_pcr = { VK_SHADER_STAGE_VERTEX_BIT, 0, D3D8_GLSL_EYE_BYTES };
+        if (stereo_wanted()) {
+            pl.pushConstantRangeCount = 1;
+            pl.pPushConstantRanges = &eye_pcr;
+        }
+    }
     if (vkCreatePipelineLayout(s_dev, &pl, NULL, &s_playout) != VK_SUCCESS)
         return 0;
     {
@@ -6171,7 +8041,8 @@ static int init(void)
     if (!s_pso || !s_fs)
         return 0;
     s_pcache = pcache_load();
-    s_vs_pass = module_from_glsl(NVK_STAGE_VERTEX, s_vs_pass_glsl, "vs_pass");
+    s_vs_pass = module_from_glsl(NVK_STAGE_VERTEX, stereo_wanted() ? s_vs_pass_eye_glsl : s_vs_pass_glsl,
+                                 "vs_pass");
     s_fs_basic = module_from_glsl(NVK_STAGE_FRAGMENT, s_fs_basic_glsl, "fs_basic");
     if (!s_vs_pass || !s_fs_basic) {
         XR_ERROR( LOGP "base shaders failed\n");
@@ -6493,6 +8364,25 @@ static void vk_on_flip(uint32_t surface_offset, uint32_t pitch)
                 }
                 slot = NULL;
             }
+#if defined(XBOXRECOMP_VK_XR)
+            if (slot && s_st_on) {
+                /* The headset's eyes: the picture again for each (stereo). */
+                void *eimg[2];
+                nvkxr_eye eyes[2];
+                float scale = 1.0f;
+                uint32_t ew = hcw, eh = hch;
+                nvkxr_eye_size(&ew, &eh);
+                s_st_fx = (float)ew / (float)hcw;
+                s_st_fy = (float)eh / (float)hch;
+                if (nvkxr_back_eyes(ew, eh, eimg, eyes, &scale)) {
+                    int got = stereo_replay(rt, hcw, hch, (struct nvk_image **)eimg, eyes, scale,
+                                            (struct nvk_image *)nvkxr_back_hud(hcw, hch),
+                                            xbox_vr_scene && xbox_vr_scene() == 1);
+                    if (got)
+                        nvkxr_back_stereo(got);
+                }
+            }
+#endif
             if (slot) {
                 VkImageCopy ic;
                 end_encoder();
@@ -6550,6 +8440,8 @@ static void vk_on_flip(uint32_t surface_offset, uint32_t pitch)
          * one is recorded. */
         s_flush_fence = 1;
         flush(0, FL_FLIP);
+        garbage_unhold();
+        st_rec_reset();
         t = prof ? now_ns() : 0;
         {
             uint64_t w0 = s_frame_waits;
@@ -6619,6 +8511,17 @@ static void vk_on_flip(uint32_t surface_offset, uint32_t pitch)
                 (unsigned long long)s_frame_waits,
                 s_frame_waits ? (double)s_frame_wait_ns / (double)s_frame_waits / 1e6 : 0.0);
     }
+    if (s_st_on && (s_presents % 300) == 0)
+        fprintf(stderr, LOGP "stereo: %llu frames in stereo, %llu without world draws, %llu"
+                " spoilt; %llu eye draws (%llu world); %llu with a HUD panel; borrowed projections"
+                " %llu, screen draws rebuilt %llu, bars left out %llu, letterboxed composites"
+                " stretched %llu\n",
+                (unsigned long long)s_st_frames,
+                (unsigned long long)s_st_none, (unsigned long long)s_st_spoilt,
+                (unsigned long long)s_st_draws, (unsigned long long)s_st_world,
+                (unsigned long long)s_st_hud_frames, (unsigned long long)s_st_borrow,
+                (unsigned long long)s_st_reproj, (unsigned long long)s_st_bars,
+                (unsigned long long)s_st_stretch);
     if (prof) {
         s_pa.flip += now_ns() - t_flip0;
         if (++s_pa.n == 300) {

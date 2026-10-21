@@ -92,6 +92,60 @@ extern "C" {
  */
 #define D3D8_GLSL_SCREEN_SPACE 0x1
 
+/**
+ * With D3D8_GLSL_STEREO (and D3D8_GLSL_SCREEN_SPACE) the program's clip-space
+ * position is kept as it was just before the program starts its conversion
+ * to screen space (the first instruction that reads the viewport constants
+ * c[58]/c[59] or takes rcc of oPos.w), and a push constant block
+ * D3D8_GLSL_EYE can replace the output with that position taken to an eye's
+ * clip space: eye.mode.x != 0 and the program's own screen x and y matching
+ * the kept position through c[58]/c[59] give
+ *   E = eye.m * clip; xy through the game's viewport mapping, as the flat
+ *   output's; depth E.z/E.w plus the program's own depth change.
+ * eye.mode.x == 0 leaves the output as without the flag.
+ */
+#define D3D8_GLSL_STEREO 0x2
+#define D3D8_GLSL_EYE \
+    "layout(push_constant) uniform Eye { mat4 m; uvec4 mode; vec4 qz; vec4 cam; } eye;\n"
+#define D3D8_GLSL_EYE_BYTES 112
+/* eye.mode.x == 2: the program's output is a screen position already (a
+ * pass-through of pretransformed vertices: billboards, particles, glows).
+ * Its game clip position is rebuilt from its depth through the game
+ * camera's projection (eye.qz: Q, Z0, as d3d8's z = Q + Z0 / w) and the
+ * camera's viewport (eye.cam: its c[58].xy, c[59].xy), taken to the eye and
+ * back through that viewport: E = eye.m * (g * w, z * w, w) with g the
+ * camera's NDC and w = Z0 / (z - Q), keeping its own depth value (what it
+ * was tested against stays the same). Depth 0 (a 2D glow or flare over the
+ * scene) goes along its screen ray far away; negative depths (clipped) and
+ * depths at the far plane (backdrops) keep the flat output. NDC is the
+ * draw's surface NDC, SCALE and OFF the surface's pixel-to-NDC mapping. */
+#define D3D8_GLSL_EYE_REPROJECT(NDC, Z, SCALE, OFF) \
+    "    if (eye.mode.x == 2u) {\n" \
+    "        float zn = " Z ";\n" \
+    "        float zr = (zn >= 0.0 && zn <= 0.0001) ? 0.9998 : zn;\n" \
+    "        vec2 cA = eye.cam.xy * (" SCALE ");\n" \
+    "        vec2 cB = eye.cam.zw * (" SCALE ") + (" OFF ");\n" \
+    "        if (zr > 0.0 && zr < 0.9999 && zr < eye.qz.x && cA.x != 0.0 && cA.y != 0.0) {\n" \
+    "            float rw = eye.qz.y / (zr - eye.qz.x);\n" \
+    "            if (rw > 0.0) {\n" \
+    "                vec2 g = ((" NDC ") - cB) / cA;\n" \
+    "                vec4 E = eye.m * vec4(g * rw, zr * rw, rw);\n" \
+    "                gl_Position = vec4(E.xy * cA + cB * E.w, clamp(zn, 0.0, 1.0) * E.w, E.w);\n" \
+    "            }\n" \
+    "        }\n" \
+    "    }\n"
+
+/** What D3D8_GLSL_STEREO can do with a program: capture is 1 when it has the
+ * viewport conversion (a clip-space position to keep), rows[] the constants
+ * whose dot products give oPos.x, .y, .z, .w (its view-projection rows), -1
+ * where none. */
+typedef struct D3D8VshStereo {
+    int capture;
+    int rows[4];
+} D3D8VshStereo;
+
+void d3d8_vsh_stereo_info(const NV2AVshProgram *program, D3D8VshStereo *out);
+
 int d3d8_vsh_generate_glsl(const NV2AVshProgram *program, unsigned flags,
                            char *buf, int bufsize);
 
