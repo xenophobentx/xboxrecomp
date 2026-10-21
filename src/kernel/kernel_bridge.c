@@ -558,6 +558,19 @@ static void thread_set_os_name(const char *name)
 
 void xbox_log_thread_role(const char *role, uint32_t routine)
 {
+#if defined(__linux__) && !defined(__ANDROID__)
+    /* As on Android, below, on a Linux host with cores of different kinds:
+     * the executor on the fastest (RECOMP_EXEC_CPU=<n> names one, =off
+     * leaves it); nothing on a host whose cores are all alike. */
+    if (role && !strcmp(role, "nv2a-ack")) {
+        const char *e = getenv("RECOMP_EXEC_CPU"), *g = recomp_env(RENV_GUEST_CPUS);
+        int cpu = e && *e >= '0' && *e <= '9' ? atoi(e) : recomp_host_cpu_rank(0);
+        if (!(e && !strcmp(e, "off")) && !(g && !strcmp(g, "all")) && cpu >= 0
+                && SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)1 << cpu))
+            fprintf(stderr, "  [KERNEL] executor thread on cpu %d%s\n", cpu,
+                    e && *e >= '0' && *e <= '9' ? " (RECOMP_EXEC_CPU)" : " (the fastest core)");
+    }
+#endif
 #if defined(__ANDROID__)
     /* The executor on the fastest core (see xbox_GuestCpuMask), unless the
      * guest threads are unpinned too (RECOMP_GUEST_CPUS=all) or
@@ -567,7 +580,8 @@ void xbox_log_thread_role(const char *role, uint32_t routine)
         int cpu = e && *e >= '0' && *e <= '9' ? atoi(e) : recomp_android_fast_cpu();
         if (!(e && !strcmp(e, "off")) && !(g && !strcmp(g, "all")) && cpu >= 0
                 && SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)1 << cpu))
-            fprintf(stderr, "  [KERNEL] executor thread on cpu %d (the fastest core)\n", cpu);
+            fprintf(stderr, "  [KERNEL] executor thread on cpu %d%s\n", cpu,
+                    e && *e >= '0' && *e <= '9' ? " (RECOMP_EXEC_CPU)" : " (the fastest core)");
     }
 #endif
     static DWORD main_tid;   /* the thread that logged process-main */
