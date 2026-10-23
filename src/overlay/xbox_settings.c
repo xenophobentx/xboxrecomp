@@ -202,6 +202,7 @@ static xs_setting s_set[XS_COUNT] = {
     [XS_GRAPHICS_TEXUP_ROADS] = SETTING("graphics.texup_roads", XS_BOOL, 0, RENV_GFX_TEXUP_ROADS, NULL, NULL, 0, 0, 0),
     /* BO-272: on as shipped; off spreads the jobs through the race. Live. */
     [XS_GRAPHICS_TEXUP_PRELOAD] = SETTING("graphics.texture_upscale_preload", XS_BOOL, 0, RENV_GFX_TEXUP_PRELOAD, NULL, NULL, 0, 0, 1),
+    [XS_GRAPHICS_SOFTBODY]  = SETTING("graphics.softbody", XS_BOOL, XS_RESTART, RENV_GFX_SOFTBODY, NULL, NULL, 0, 0, 0),
     [XS_GAME_RACE_CLOCK]    = SETTING("game.race_clock", XS_BOOL, 0, RENV_GAME_RACE_CLOCK, NULL, NULL, 0, 0, 0),
     /* With a music folder set: the title starts on the custom soundtrack the
      * player last chose in its EA GAMES TRAX screen (the port does it;

@@ -287,6 +287,7 @@ static constexpr Meta k_meta[XS_COUNT] = {
     /* XS_GRAPHICS_TEXUP_ROADS */ { XS_GRAPHICS_TEXUP_ROADS, "Upscale road surfaces", "Off leaves the road surfaces as the game has them: the upscalers can make their fine grain look noisy. On upscales them too.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_DISPLAY_CRASHNAV_MAP */ { XS_DISPLAY_CRASHNAV_MAP, "Crash Nav map", "The map in Crash Nav (Select Location) with Widescreen HUD on in 16:9. Full width spreads the map, its route and its markers across the screen like the frame around it. 4:3 keeps the map the shape of the rest of the menu, with the frame beside it. Changes at once.", 1, FMT_PLAIN, n_crashnav_map, 0 },
     /* XS_GRAPHICS_TEXUP_PRELOAD */ { XS_GRAPHICS_TEXUP_PRELOAD, "Upscale while loading", "Does most of the sharpening during the loading screen and the countdown, so the first race on a new track has less of it to do; a fast PC can leave it off.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_GRAPHICS_SOFTBODY */  { XS_GRAPHICS_SOFTBODY, "Soft-body damage", "Cars crumple, tear and bend where they are hit, with the game's own sparks and debris where metal rips, instead of only losing panels. Drawn only: handling and the race are unchanged. Costs CPU in big pile-ups. Applies after a restart.", 1, FMT_PLAIN, NULL, 0 },
 #if defined(__ANDROID__)
     /* XS_INPUT_VIBRATION */    { XS_INPUT_VIBRATION, "Vibration", "Where rumble goes. Auto uses this device's vibrator while its built-in controls are in use. External controllers don't rumble on Android; This device vibrates anyway.", 1, FMT_PLAIN, n_vibration, 0 },
     /* XS_INPUT_TOUCH */        { XS_INPUT_TOUCH, "Touch controls", "On-screen controls. In a race: steer with the left thumb anywhere on the left half, GAS, BRAKE and BOOST on the right (BOOST keeps accelerating). In menus: a d-pad and A B X Y. Pause and this menu are at the top, left of centre. Auto hides them while a controller is used and shows them again when you touch the screen.", 1, FMT_PLAIN, n_touch, 0 },
@@ -1126,6 +1127,8 @@ static int page_rows(int page, Row *r)
             SET(XS_GRAPHICS_SPLIT_60FPS);
         if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_HIGH_REFRESH)->key))
             SET(XS_GRAPHICS_HIGH_REFRESH);
+        if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_SOFTBODY)->key))
+            SET(XS_GRAPHICS_SOFTBODY);
         if (recomp_patch_enabled(xbox_SettingGet(XS_GAME_RACE_CLOCK)->key))
             SET(XS_GAME_RACE_CLOCK);
         if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_VEHICLE_DETAIL)->key))

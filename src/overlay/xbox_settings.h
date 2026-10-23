@@ -109,6 +109,7 @@ typedef enum {
     XS_GRAPHICS_TEXUP_ROADS, /* and the road surfaces too (off: the title's road skip list) */
     XS_DISPLAY_CRASHNAV_MAP, /* BO-222: with the widescreen HUD, a title's map screen full width or 4:3 */
     XS_GRAPHICS_TEXUP_PRELOAD, /* BO-272: the upscaler works through the loading screen and countdown, on as shipped */
+    XS_GRAPHICS_SOFTBODY,    /* a title's soft-body vehicle damage (drawn only), off as shipped; read at start */
 #if defined(__ANDROID__)
     XS_INPUT_VIBRATION,      /* pad motors or the device's vibrator (android_vibration.c) */
     XS_INPUT_TOUCH,          /* the on-screen controls: auto / always / off (touch_pad.h) */
