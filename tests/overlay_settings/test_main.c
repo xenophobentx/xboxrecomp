@@ -129,7 +129,8 @@ static void test_restart_flags(void)
 
     for (i = 0; i < XS_COUNT; i++) {
         const xs_setting *s = xbox_SettingGet((xs_id)i);
-        int want = i == XS_DISPLAY_ASPECT || i == XS_GRAPHICS_RENDER_SCALE || i == XS_AUDIO_SPEAKERS;
+        int want = i == XS_DISPLAY_ASPECT || i == XS_GRAPHICS_RENDER_SCALE || i == XS_AUDIO_SPEAKERS
+                || i == XS_GAME_LANGUAGE;
 #if defined(__ANDROID__)
         want = want || i == XS_INPUT_VIBRATION;
 #endif

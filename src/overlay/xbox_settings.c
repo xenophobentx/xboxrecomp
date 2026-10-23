@@ -84,6 +84,8 @@ static const char *const k_timing[]   = { "legacy", "auto", NULL };
 static const char *const k_frame_pacing[] = { "auto", "low_latency", "smooth", NULL };
 static const char *const k_custom_level[] = { "off", "quieter", "match", "louder", NULL };
 static const char *const k_hdr_decode[] = { "2.2", "srgb", NULL };
+/* XC_LANGUAGE 1..9 (kernel.h xbox_language_names): the kernel reads the name. */
+static const char *const k_language[] = { "english", "japanese", "german", "french", "spanish", "italian", "korean", "chinese", "portuguese", NULL };
 
 /* Designated, so the state half of the struct starts zero. */
 #define SETTING(k, t, f, e, c, ev, mn, mx, b) \
@@ -208,6 +210,8 @@ static xs_setting s_set[XS_COUNT] = {
      * audio.custom_music_soundtrack remembers which). On as shipped. Read at
      * the title's start. */
     [XS_AUDIO_CUSTOM_AT_START] = SETTING("audio.custom_music_at_start", XS_BOOL, 0, RENV_AUDIO_CUSTOM_AT_START, NULL, NULL, 0, 0, 1),
+    /* Read by the kernel when the title asks, early in boot: a restart. */
+    [XS_GAME_LANGUAGE]      = SETTING("game.language", XS_CHOICE, XS_RESTART, RENV_GAME_LANGUAGE, k_language, NULL, 0, 0, 0),
 #if defined(__ANDROID__)
     [XS_INPUT_VIBRATION]    = SETTING("input.vibration", XS_CHOICE, XS_RESTART, RENV_ANDROID_VIBRATION, k_vibration, NULL, 0, 0, 0),
     /* The on-screen controls (touch_pad.h, BO-189). Live. */
@@ -1120,6 +1124,18 @@ int xbox_SettingsTextIsSet(const char *key)
 const char *xbox_SettingsPath(void)
 {
     return s_path;
+}
+
+static unsigned s_languages;
+
+void xbox_SettingsSetLanguages(unsigned mask)
+{
+    s_languages = mask;
+}
+
+unsigned xbox_SettingsLanguages(void)
+{
+    return s_languages;
 }
 
 void xbox_SettingsSetBackground(int bg)

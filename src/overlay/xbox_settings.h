@@ -109,6 +109,7 @@ typedef enum {
     XS_GRAPHICS_TEXUP_ROADS, /* and the road surfaces too (off: the title's road skip list) */
     XS_DISPLAY_CRASHNAV_MAP, /* BO-222: with the widescreen HUD, a title's map screen full width or 4:3 */
     XS_GRAPHICS_TEXUP_PRELOAD, /* BO-272: the upscaler works through the loading screen and countdown, on as shipped */
+    XS_GAME_LANGUAGE,        /* the dashboard language the kernel reports (XC_LANGUAGE); a row only where the title has more than one */
 #if defined(__ANDROID__)
     XS_INPUT_VIBRATION,      /* pad motors or the device's vibrator (android_vibration.c) */
     XS_INPUT_TOUCH,          /* the on-screen controls: auto / always / off (touch_pad.h) */
@@ -195,6 +196,13 @@ double  xbox_PowerModeAtLoad(xs_host h, double stored);
 
 /* The window is in the background: audio.mute_background silences it. */
 void xbox_SettingsSetBackground(int bg);
+
+/* The languages the title has on its disc, bit i for game.language's
+ * choice i (bit 0 English ... bit 8 Portuguese, XC_LANGUAGE - 1). The
+ * Language row shows when there is more than one and steps over the
+ * others. 0 (the default) shows no row. */
+void     xbox_SettingsSetLanguages(unsigned mask);
+unsigned xbox_SettingsLanguages(void);
 
 /* The bug report's parts that come from here (xbox_report.h): settings.toml
  * attached, the settings with their sources, the shader cache's counts.

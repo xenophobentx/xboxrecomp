@@ -207,6 +207,7 @@ static const char *const n_texup_sc[]  = { "2x", "4x", NULL };
 static const char *const n_glyphs[]    = { "Auto (the controller in use)", "Xbox (original)", "Xbox (modern: LB RB LT RT)", "PlayStation (DualShock 3, 4)", "PlayStation 5 (DualSense)", "Nintendo", "Steam (Deck, Steam Controller)", "Positional (any pad)", "Keyboard", NULL };
 static_assert(sizeof n_glyphs / sizeof n_glyphs[0] == XBOX_GLYPHS_MODE_COUNT + 1, "one name per glyph mode, in pad_glyphs.h order");
 static const char *const n_units[]     = { "mph (as shipped)", "km/h", NULL };
+static const char *const n_language[]  = { "English", "Japanese", "German", "French", "Spanish", "Italian", "Korean", "Chinese", "Portuguese", NULL };
 static const char *const n_ultrawide[] = { "Off", "21:9", "32:9", "Window", NULL };
 static const char *const n_vehicle_detail[] = { "Original", "Far (2x)", "Farthest (4x)", NULL };
 static const char *const n_scenery_detail[] = { "Original", "Far", NULL };
@@ -287,6 +288,7 @@ static constexpr Meta k_meta[XS_COUNT] = {
     /* XS_GRAPHICS_TEXUP_ROADS */ { XS_GRAPHICS_TEXUP_ROADS, "Upscale road surfaces", "Off leaves the road surfaces as the game has them: the upscalers can make their fine grain look noisy. On upscales them too.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_DISPLAY_CRASHNAV_MAP */ { XS_DISPLAY_CRASHNAV_MAP, "Crash Nav map", "The map in Crash Nav (Select Location) with Widescreen HUD on in 16:9. Full width spreads the map, its route and its markers across the screen like the frame around it. 4:3 keeps the map the shape of the rest of the menu, with the frame beside it. Changes at once.", 1, FMT_PLAIN, n_crashnav_map, 0 },
     /* XS_GRAPHICS_TEXUP_PRELOAD */ { XS_GRAPHICS_TEXUP_PRELOAD, "Upscale while loading", "Does most of the sharpening during the loading screen and the countdown, so the first race on a new track has less of it to do; a fast PC can leave it off.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_GAME_LANGUAGE */      { XS_GAME_LANGUAGE, "Language", "The language of the game's text, speech and films, as an Xbox set to that language would show them. Only the languages on your disc are offered. Applies after a restart.", 1, FMT_PLAIN, n_language, 0 },
 #if defined(__ANDROID__)
     /* XS_INPUT_VIBRATION */    { XS_INPUT_VIBRATION, "Vibration", "Where rumble goes. Auto uses this device's vibrator while its built-in controls are in use. External controllers don't rumble on Android; This device vibrates anyway.", 1, FMT_PLAIN, n_vibration, 0 },
     /* XS_INPUT_TOUCH */        { XS_INPUT_TOUCH, "Touch controls", "On-screen controls. In a race: steer with the left thumb anywhere on the left half, GAS, BRAKE and BOOST on the right (BOOST keeps accelerating). In menus: a d-pad and A B X Y. Pause and this menu are at the top, left of centre. Auto hides them while a controller is used and shows them again when you touch the screen.", 1, FMT_PLAIN, n_touch, 0 },
@@ -1074,6 +1076,11 @@ static int page_rows(int page, Row *r)
 #endif
         if (recomp_patch_enabled(xbox_SettingGet(XS_GAME_SPEED_UNITS)->key))
             SET(XS_GAME_SPEED_UNITS);
+        {
+            unsigned langs = xbox_SettingsLanguages();
+            if (langs & (langs - 1))    /* more than one on the title's disc */
+                SET(XS_GAME_LANGUAGE);
+        }
         if (recomp_patch_enabled(xbox_SettingGet(XS_DISPLAY_HUD_FIX)->key))
             SET(XS_DISPLAY_HUD_FIX);
         /* The map screen's shape: only with the widescreen HUD on. */
@@ -1626,6 +1633,8 @@ static void adjust(xs_id id, int dir)
             unsigned off = m.disabled;
             if (id == XS_POWER_MODE && xbox_PowerStockHidden(xbox_SettingsHost()))
                 off |= 1u;      /* Maximum: not offered here (BO-75) */
+            if (id == XS_GAME_LANGUAGE)
+                off |= ~xbox_SettingsLanguages();   /* not on the title's disc */
             if (!(off & (1u << i)))
                 break;
         }

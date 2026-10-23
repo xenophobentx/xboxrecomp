@@ -1233,6 +1233,15 @@ NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(ULONG ValueIndex, ULONG Type, P
 void  xbox_SetVideoSettings(ULONG xc_video, ULONG smc_video_mode);
 ULONG xbox_GetVideoSettings(void);
 
+/* XC_LANGUAGE: the dashboard's language, 1 English ... 9 Portuguese, in
+ * the dashboard's order (xbox_language_names[0] is 1). game.language /
+ * RECOMP_GAME_LANGUAGE picks it, by name or number; English when unset, as
+ * before. The title chooses its text, speech and films from it. */
+#define XC_LANGUAGE_ENGLISH       1
+#define XC_LANGUAGE_COUNT         9
+extern const char *const xbox_language_names[XC_LANGUAGE_COUNT + 1];
+ULONG xbox_GetLanguage(void);
+
 /* Unknown ordinals - stub */
 VOID    __stdcall xbox_Unknown_8(void);
 VOID    __stdcall xbox_Unknown_23(void);
