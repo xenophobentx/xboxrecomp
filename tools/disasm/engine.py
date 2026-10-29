@@ -292,20 +292,44 @@ class DisasmEngine:
                 if target is None or not (lo <= target < hi):
                     break
                 entries += 1
+            start = tbl
             if entries < min_entries:
-                # Too short to distinguish from code that merely looks like
-                # pointers. Leaving it alone costs nothing; a wrong skip here
-                # would delete real instructions.
-                continue
+                # A table indexed downward from its displacement. MSVC's
+                # memcpy/memmove unwind their last dwords with
+                #
+                #     neg  ecx                 ; 0..-7
+                #     jmp  [ecx*4 + UnwindVec]
+                #
+                # so the table is the entries *below* the base, ending with
+                # the base slot itself; upward the next word is already the
+                # first arm's code. Left unmeasured, its bytes are decoded as
+                # instructions, and the pointers can spell branches: on the
+                # PAL Burnout 3 an entry 0x00244874 reads `je 0x24488A`, which
+                # cut memcpy short of its arms (an unresolved indirect jump at
+                # 0x00244854 during XAPI init). Arms sit next to their table,
+                # so only nearby code pointers count.
+                below = 0
+                while below < 32:
+                    target = self.image.read_u32_at_va(tbl - (below + 1) * 4)
+                    if (target is None or not (lo <= target < hi)
+                            or abs(target - tbl) > 0x1000):
+                        break
+                    below += 1
+                if below < 2 or below + entries < min_entries:
+                    # Too short to distinguish from code that merely looks
+                    # like pointers. Leaving it alone costs nothing; a wrong
+                    # skip here would delete real instructions.
+                    continue
+                start = tbl - below * 4
 
             end = tbl + entries * 4
             for insn in self.get_instructions_in_range(
-                    tbl - 16, end):
-                if insn.end_address > tbl and insn.address < end:
+                    start - 16, end):
+                if insn.end_address > start and insn.address < end:
                     del self.instructions[insn.address]
             self._sorted_addrs = None
 
-            self.jump_tables[tbl] = end
+            self.jump_tables[start] = end
             self.decode_at(end)
             resynced += 1
 
@@ -355,8 +379,17 @@ class DisasmEngine:
         return addr in self._jt_candidates
 
     def jump_table_entries(self, tbl: int) -> List[int]:
-        """Code pointers held by a resynced jump table, or [] if unknown."""
+        """Code pointers held by a resynced jump table, or [] if unknown.
+
+        `tbl` is a table's displacement. A table indexed downward
+        (resync_jump_tables) starts below its displacement, so a displacement
+        inside a measured table names that whole table."""
         end = self.jump_tables.get(tbl)
+        if end is None:
+            for start, stop in self.jump_tables.items():
+                if start < tbl < stop:
+                    tbl, end = start, stop
+                    break
         if end is None:
             return []
         return [self.image.read_u32_at_va(a) or 0
