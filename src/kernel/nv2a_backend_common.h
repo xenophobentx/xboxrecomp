@@ -1149,6 +1149,24 @@ void nv2a_occ_set_scale_x2(struct nv2a_occ *o, unsigned x2);
 void nv2a_resample_nearest32(const uint8_t *src, uint32_t src_pitch, uint32_t sw, uint32_t sh,
                              uint8_t *dst, uint32_t dst_pitch, uint32_t dw, uint32_t dh);
 
+/* BO-178, reductions of a scaled render target. A title's post effect
+ * (Burnout 3's bloom: 640x480 -> 320x240 -> 160x120) reads a whole target
+ * into a smaller one with a few point or bilinear taps placed in the
+ * title's texels: at 1x they cover the source, at a render scale they hit
+ * a few host texels of each title texel and skip the rest, so the result
+ * is coarser than 1x and flickers as the picture moves. A draw that reads
+ * a scaled target (host size above guest size) into a target smaller than
+ * it in guest pixels (not larger on either side, smaller on one) reads
+ * instead an area-averaged copy of it at its guest size: the 1x texels,
+ * sampled at host-pixel positions. Same-size passes (a blur in place, a
+ * self copy) and enlargements keep the host-size texture. At 1x nothing is
+ * scaled and nothing changes. */
+int nv2a_rt_reduce_draw(uint32_t src_w, uint32_t src_h, uint32_t src_hw, uint32_t src_hh,
+                        uint32_t dst_w, uint32_t dst_h);
+/* RECOMP_DEBUG=rt_reduce=0 turns it off; rt_reduce_ab=n on for n flips,
+ * off for n (one line on each change). `flips`: the backend's flip count. */
+int nv2a_rt_reduce_on(uint32_t flips);
+
 /* Host size of a guest w x h target at `scale`: w*N x h*N, N lowered for
  * this target until both fit max_dim. Returns the N used (>= 1). */
 unsigned nv2a_host_size(uint32_t w, uint32_t h, unsigned scale, uint32_t max_dim,

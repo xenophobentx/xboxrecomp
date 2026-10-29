@@ -142,6 +142,35 @@ Many of the title's world textures (the road among them) have one level only
 although their filter asks for mips; no bias reaches those, which is why
 `auto` changes little on the road at a distance.
 
+## Reductions of a scaled target (BO-178)
+
+A title's post effects read a whole render target into a smaller one with a
+few taps placed in its own texels. Burnout 3's bloom draws the 640x480 frame
+into 320x240 with four point taps (one per stage), then that into 160x120
+with four bilinear taps; its radial blur reads the frame into 320x240 the
+same way. At 1x four taps cover each 2x2 block. At a render scale they land
+on 4 of the 16 host texels of that block at 2x, 4 of 36 at 3x: a small
+bright spot (a tail light, a highlight) passes the bloom's threshold on one
+frame and not the next, and comes out as a grid of glow dots that 1x never
+draws.
+
+A draw that reads a scaled target into a target smaller than it in guest
+pixels (`nv2a_rt_reduce_draw`: not larger on either side, smaller on one)
+reads instead a copy of the target at its guest size, each texel the area
+average of the host texels under it (`rt_reduced` in both backends, one
+full-screen pass, made again only when the target was drawn since; a
+part-covered host texel counts by its share, so 1.5x works too). The
+title's taps then read the 1x texels at host-pixel positions. Same-size
+passes (a blur in place, a self copy) and enlargements read the host-size
+texture as before, and at 1x nothing is scaled, so nothing changes. Which
+draws are reductions is decided from the sizes only, so every such pass
+of a title gets it: in Burnout 3 the bloom's two, the radial blur's, and a
+pass of the pause menu's highlight bar.
+
+`RECOMP_DEBUG=rt_reduce=0` gives the old picture; `rt_reduce_ab=<n>` swaps
+every n flips for comparisons; `RECOMP_TRACE=metal_frame` lists each copy
+as `reduce`.
+
 ## 2D art upscaling (`graphics.ui_scale`, off by default)
 
 PPSSPP's texture scaling for the 2D art only: a texture the title draws its

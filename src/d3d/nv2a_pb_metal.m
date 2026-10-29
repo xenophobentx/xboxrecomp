@@ -254,14 +254,37 @@ static const char s_msl[] =
     "    o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);\n"
     "    return o;\n"
     "}\n"
-    "fragment float4 fs_clear(constant float4 &c [[buffer(0)]]) { return c; }\n";
+    "fragment float4 fs_clear(constant float4 &c [[buffer(0)]]) { return c; }\n"
+    /* BO-178 (rt_reduced): one guest texel of a scaled target, the area
+     * average of the host texels under it; r is host texels per guest
+     * texel (2 at 2x, 1.5 at 1.5x), so a part-covered host texel counts by
+     * its share; q.z: alpha reads 1 (a 16-bit surface, rt_opaque). */
+    "fragment float4 fs_reduce(ClearV i [[stage_in]], texture2d<float> src [[texture(0)]],\n"
+    "                          constant float4 &q [[buffer(0)]]) {\n"
+    "    float2 r = q.xy, p0 = floor(i.pos.xy) * r, p1 = p0 + r;\n"
+    "    int2 a = int2(floor(p0)), b = int2(ceil(p1)) - 1;\n"
+    "    float4 sum = float4(0.0);\n"
+    "    float ws = 0.0;\n"
+    "    for (int y = a.y; y <= b.y; y++) {\n"
+    "        float wy = min(p1.y, float(y + 1)) - max(p0.y, float(y));\n"
+    "        for (int x = a.x; x <= b.x; x++) {\n"
+    "            float w = wy * (min(p1.x, float(x + 1)) - max(p0.x, float(x)));\n"
+    "            sum += src.read(uint2(x, y)) * w;\n"
+    "            ws += w;\n"
+    "        }\n"
+    "    }\n"
+    "    sum = ws > 0.0 ? sum / ws : float4(0.0);\n"
+    "    if (q.z != 0.0) sum.a = 1.0;\n"
+    "    return sum;\n"
+    "}\n";
 
 /* ---- device ---------------------------------------------------------------- */
 
 static id<MTLDevice>               s_dev;
 static id<MTLCommandQueue>         s_queue;
 static id<MTLFunction>             s_vs_pass, s_fs_basic;
-static id<MTLFunction>             s_vs_clear, s_fs_clear;
+static id<MTLFunction>             s_vs_clear, s_fs_clear, s_fs_reduce;
+static id<MTLRenderPipelineState>  s_reduce_pso;     /* rt_reduced, made on first use */
 static id<MTLRenderPipelineState>  s_clear_pso[2];   /* partial clears: without, with depth */
 static id<MTLRenderPipelineState>  s_clear_pso_hdr[2];   /* the same for half-float targets (BO-110) */
 static MTLCompileOptions          *s_opts;     /* fast math off, kept for M2's shaders */
@@ -339,6 +362,9 @@ typedef struct {
     uint64_t       gen;        /* s_rt_seq at its last clear or draw */
     int            presented;  /* ever picked by present_target */
     struct nv2a_rt_own own;    /* is the guest memory under it still its own */
+    id<MTLTexture> gtex;       /* BO-178: tex area-averaged to w x h (rt_reduced), or nil */
+    uint64_t       ggen;       /* gen gtex was made at */
+    int            gopaque;    /* gtex made with alpha 1 (a 16-bit surface) */
 } RenderTarget;
 
 static RenderTarget  s_rt[RT_MAX];
@@ -348,6 +374,7 @@ static DepthTarget  *s_enc_dt;   /* and its depth attachment, or NULL */
 static DepthTarget   s_dt[DT_MAX];
 static uint64_t      s_tick;
 static uint64_t      s_zclears, s_draws_z, s_rtt_binds, s_self_copies;
+static uint64_t      s_reduce_binds, s_reduce_made;   /* BO-178, rt_reduced */
 static uint64_t      s_stale_drops, s_retired;
 static uint64_t      s_grows, s_partial_clears;   /* rt_grow, metal_on_clear */
 
@@ -668,13 +695,16 @@ static void mf_flip(void)
     if (s_mf_on <= 0)
         return;
     for (i = 0; i < s_mf_n; i++)
-        if (s_mf[i].kind == 'X') copies++; else passes++;
+        if (s_mf[i].kind == 'X' || s_mf[i].kind == 'R') copies++; else passes++;
     n += snprintf(line + n, sizeof line - (size_t)n, "frame %llu: %d passes %d copies",
                   (unsigned long long)s_presents, passes + s_mf_over, copies);
     for (i = 0; i < s_mf_n; i++) {
         if (s_mf[i].kind == 'X')
             n += snprintf(line + n, sizeof line - (size_t)n, " | copy %ux%u",
                           s_mf[i].w, s_mf[i].h);
+        else if (s_mf[i].kind == 'R')   /* BO-178: rt_reduced */
+            n += snprintf(line + n, sizeof line - (size_t)n, " | reduce 0x%08X %ux%u<%ux%u",
+                          s_mf[i].off, s_mf[i].w, s_mf[i].h, s_mf[i].hw, s_mf[i].hh);
         else
             n += snprintf(line + n, sizeof line - (size_t)n, " | 0x%08X %ux%u %c %u >%ux%u i%u",
                           s_mf[i].off, s_mf[i].w, s_mf[i].h, s_mf[i].kind, s_mf[i].draws,
@@ -787,8 +817,9 @@ static int init(void)
         s_fs_basic = [lib newFunctionWithName:@"fs_basic"];
         s_vs_clear = [lib newFunctionWithName:@"vs_clear"];
         s_fs_clear = [lib newFunctionWithName:@"fs_clear"];
+        s_fs_reduce = [lib newFunctionWithName:@"fs_reduce"];
         [lib release];
-        if (!s_vs_pass || !s_fs_basic || !s_vs_clear || !s_fs_clear) {
+        if (!s_vs_pass || !s_fs_basic || !s_vs_clear || !s_fs_clear || !s_fs_reduce) {
             XR_ERROR( LOGP "MSL functions missing\n");
             return 0;
         }
@@ -913,6 +944,7 @@ static void rt_free(RenderTarget *rt)
         end_encoder();
     [rt->opaque release];
     [rt->tex release];
+    [rt->gtex release];
     memset(rt, 0, sizeof *rt);
 }
 
@@ -4344,6 +4376,93 @@ static RenderTarget *rt_texture(const Stage *t, RenderTarget *cur)
     return &s_self;
 }
 
+/* The target whose opaque view rt_opaque handed out in s_opaque. */
+static RenderTarget *rt_of_opaque(void)
+{
+    int i;
+    for (i = 0; i < RT_MAX; i++)
+        if (s_rt[i].tex && s_rt[i].opaque && s_rt[i].opaque == s_opaque.tex)
+            return &s_rt[i];
+    return NULL;
+}
+
+/* BO-178: src at its guest size, each texel the area average of the host
+ * texels under it (fs_reduce), for a draw that reads src into a smaller
+ * target (nv2a_rt_reduce_draw). Made again only when src was drawn since;
+ * a pass of its own, so the open one ends. nil when it cannot be made: the
+ * draw reads src as before. */
+static id<MTLTexture> rt_reduced(RenderTarget *src, int opaque)
+{
+    static int failed;
+    float r[4];
+
+    if (failed)
+        return nil;
+    if (src->gtex && (src->gtex.width != src->w || src->gtex.height != src->h)) {
+        [src->gtex release];          /* grown since: an encoded pass keeps its own */
+        src->gtex = nil;
+    }
+    if (src->gtex && src->ggen == src->gen && src->gopaque == opaque)
+        return src->gtex;
+    if (!s_reduce_pso) {
+        MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
+        NSError *err = nil;
+        pd.vertexFunction = s_vs_clear;
+        pd.fragmentFunction = s_fs_reduce;
+        pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+        s_reduce_pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+        [pd release];
+        if (!s_reduce_pso) {
+            failed = 1;
+            XR_ERROR( LOGP "reduction pipeline failed (%s): reductions read the host size\n",
+                    err ? [[err localizedDescription] UTF8String] : "?");
+            return nil;
+        }
+    }
+    if (!src->gtex) {
+        MTLTextureDescriptor *td =
+            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                               width:src->w height:src->h
+                                                           mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        src->gtex = [s_dev newTextureWithDescriptor:td];
+        if (!src->gtex)
+            return nil;
+    }
+    {
+        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        id<MTLRenderCommandEncoder> e;
+        end_encoder();
+        ensure_cmd();
+        rp.colorAttachments[0].texture = src->gtex;
+        rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        e = [s_cmd renderCommandEncoderWithDescriptor:rp];
+        r[0] = (float)src->hw / (float)src->w;
+        r[1] = (float)src->hh / (float)src->h;
+        r[2] = opaque ? 1.0f : 0.0f;   /* a 16-bit surface's alpha reads 1 (rt_opaque) */
+        r[3] = 0.0f;
+        [e setRenderPipelineState:s_reduce_pso];
+        [e setFragmentTexture:src->tex atIndex:0];
+        [e setFragmentBytes:r length:sizeof r atIndex:0];
+        [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [e endEncoding];
+    }
+    src->ggen = src->gen;
+    src->gopaque = opaque;
+    s_reduce_made++;
+    mf_add('R', src);
+    {
+        static int said;
+        if (!said++)
+            fprintf(stderr, LOGP "surface 0x%08X (%ux%u, host %ux%u) read into a smaller"
+                    " target: at its own size (BO-178; RECOMP_DEBUG=rt_reduce=0 is the"
+                    " host size)\n", src->offset, src->w, src->h, src->hw, src->hh);
+    }
+    return src->gtex;
+}
+
 /* ---- draws ------------------------------------------------------------------- */
 
 /* The scissor a draw takes: the surface clip (SET_SURFACE_CLIP_HORIZONTAL/
@@ -4580,6 +4699,19 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                 } else if ((t->mode == 3 || !stage_signed(t))
                            && (src = rt_texture(t, rt)) != NULL) {
                     stex[k] = src->tex;
+                    /* BO-178: a reduction reads the title-size copy; the
+                     * coordinates below are the same for it. */
+                    RenderTarget *own = src == &s_opaque ? rt_of_opaque() : src;
+                    if (own && own >= s_rt && own < s_rt + RT_MAX
+                            && nv2a_rt_reduce_draw(own->w, own->h, own->hw, own->hh,
+                                                   rt->w, rt->h)
+                            && nv2a_rt_reduce_on(nv2a_pb_gpu_state()->flips)) {
+                        id<MTLTexture> gt = rt_reduced(own, src == &s_opaque);
+                        if (gt) {
+                            stex[k] = gt;
+                            s_reduce_binds++;
+                        }
+                    }
                     /* Linear coordinates are texels of the surface as drawn. */
                     if (!nv2a_tex_size_from_format(t->color)) {
                         mpc.b.tex_scale[k][0] = 1.0f / (float)src->w;
@@ -4696,7 +4828,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         }
         s_draws++;
         rt->gen = ++s_rt_seq;
-        if (s_mf_on > 0 && s_mf_n && s_mf[s_mf_n - 1].kind != 'X') {
+        if (s_mf_on > 0 && s_mf_n && s_mf[s_mf_n - 1].kind != 'X' && s_mf[s_mf_n - 1].kind != 'R') {
             s_mf[s_mf_n - 1].draws++;
             s_mf[s_mf_n - 1].idx += (uint32_t)nidx;
         }
@@ -5971,8 +6103,12 @@ static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
                 s_layer ? "CAMetalLayer slots" : "texture readback",
                 (unsigned long long)s_flushes, (unsigned long long)s_report_commits,
                 frames_in_flight(), (unsigned long long)s_frame_waits);
-    if (s_presents == 1 || (s_presents % 300) == 0)
+    if (s_presents == 1 || (s_presents % 300) == 0) {
         pc_log(s_presents);
+        if (s_reduce_made)
+            fprintf(stderr, LOGP "BO-178 reductions: %llu title-size copies made, %llu binds\n",
+                    (unsigned long long)s_reduce_made, (unsigned long long)s_reduce_binds);
+    }
     if (!always && rt && addr && pitch)
         guard_flip(addr, pitch * rt->h);
     if (!pitch || !addr || layer) {
