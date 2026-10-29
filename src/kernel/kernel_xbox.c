@@ -11,6 +11,8 @@
 
 #include "kernel.h"
 #include "apu.h"                /* mcpx_apu_xc_audio: XC_AUDIO */
+#include "recomp_env.h"         /* RENV_GAME_LANGUAGE: XC_LANGUAGE */
+#include <stdlib.h>
 #include <string.h>
 
 /* ============================================================================
@@ -122,10 +124,33 @@ NTSTATUS __stdcall xbox_XeUnloadSection(PXBE_SECTION_HEADER Section)
  *   - Region: North America
  *   - Video: none of widescreen/480p/720p/1080i unless set (kernel.h,
  *     xbox_SetVideoSettings)
- *   - Language: English
+ *   - Language: English, or game.language (xbox_GetLanguage)
  *   - Audio: the APU's speaker layout, stereo or 5.1 (Dolby Digital)
  *   - DVD Region: Region 1 (North America)
  * ============================================================================ */
+
+const char *const xbox_language_names[XC_LANGUAGE_COUNT + 1] = {
+    "english", "japanese", "german", "french", "spanish", "italian",
+    "korean", "chinese", "portuguese", NULL
+};
+
+/* game.language: a name above or its number; English when unset or not
+ * one of them. Read on each query: the title asks early in boot, and a
+ * title that lacks the language's files may set the variable back before
+ * that (recomp_env_set). */
+ULONG xbox_GetLanguage(void)
+{
+    const char *v = recomp_env(RENV_GAME_LANGUAGE);
+    ULONG i;
+
+    if (!v || !*v)
+        return XC_LANGUAGE_ENGLISH;
+    for (i = 0; i < XC_LANGUAGE_COUNT; i++)
+        if (!strcmp(v, xbox_language_names[i]))
+            return i + 1;
+    i = (ULONG)strtoul(v, NULL, 10);
+    return i >= 1 && i <= XC_LANGUAGE_COUNT ? i : XC_LANGUAGE_ENGLISH;
+}
 
 NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
     ULONG ValueIndex, PULONG Type, PVOID Value, ULONG ValueLength, PULONG ResultLength)
@@ -138,9 +163,9 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
 
     switch (ValueIndex) {
     case XC_LANGUAGE:
-        /* English = 1 */
+        /* English = 1 unless game.language says otherwise */
         if (ValueLength >= sizeof(ULONG)) {
-            *(PULONG)Value = 1;
+            *(PULONG)Value = xbox_GetLanguage();
             if (Type) *Type = 4; /* REG_DWORD */
             if (ResultLength) *ResultLength = sizeof(ULONG);
         }
