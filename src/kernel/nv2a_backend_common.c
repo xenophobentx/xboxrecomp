@@ -1029,6 +1029,36 @@ void nv2a_host_set_dither(int on)
     s_dither = on ? 1 : 0;
 }
 
+int nv2a_rt_reduce_draw(uint32_t src_w, uint32_t src_h, uint32_t src_hw, uint32_t src_hh,
+                        uint32_t dst_w, uint32_t dst_h)
+{
+    if (!src_w || !src_h || !dst_w || !dst_h)
+        return 0;
+    if (src_hw <= src_w && src_hh <= src_h)
+        return 0;                       /* not scaled: 1x */
+    return dst_w <= src_w && dst_h <= src_h && (dst_w < src_w || dst_h < src_h);
+}
+
+int nv2a_rt_reduce_on(uint32_t flips)
+{
+    static int mode = -1;
+    static uint32_t ab, said = 0xFFFFFFFFu;
+    if (mode < 0) {
+        const char *e = recomp_env(RENV_RT_REDUCE), *a = recomp_env(RENV_RT_REDUCE_AB);
+        ab = a ? (uint32_t)strtoul(a, NULL, 0) : 0;
+        mode = !(e && (!strcmp(e, "0") || !strcmp(e, "off")));
+    }
+    if (ab) {
+        uint32_t half = (flips / ab) & 1u;
+        if (half != said) {
+            said = half;
+            fprintf(stderr, "[RT-REDUCE] ab: %s from flip %u\n", half ? "off" : "on", flips);
+        }
+        return half ? 0 : mode;
+    }
+    return mode;
+}
+
 unsigned nv2a_host_render_scale(void)
 {
     return s_host_opts.render_scale > 1 ? s_host_opts.render_scale : 1;

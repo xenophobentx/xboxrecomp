@@ -882,6 +882,9 @@ struct RenderTarget {
     int              presented;  /* ever picked by present_target */
     uint64_t         pass_flip;  /* vk_frame: s_presents + 1 at its last pass */
     struct nv2a_rt_own own;      /* is the guest memory under it still its own */
+    struct nvk_image gim;        /* BO-178: im area-averaged to w x h (rt_reduced) */
+    uint64_t         ggen;       /* gen gim was made at */
+    int              gopaque;    /* gim made with alpha 1 (a 16-bit surface) */
 };
 
 static RenderTarget  s_rt[RT_MAX];
@@ -889,6 +892,7 @@ static uint64_t      s_rt_seq;   /* bumped by every pass begun and draw recorded
 static DepthTarget   s_dt[DT_MAX];
 static uint64_t      s_tick;
 static uint64_t      s_zclears, s_draws_z, s_rtt_binds, s_self_copies;
+static uint64_t      s_reduce_binds, s_reduce_made;   /* BO-178, rt_reduced */
 static uint64_t      s_stale_drops, s_retired, s_decode_syncs;
 static uint64_t      s_grows, s_partial_clears;
 
@@ -952,6 +956,8 @@ static void rt_free(RenderTarget *rt)
     if (s_enc_rt == rt)
         end_encoder();
     garbage_push(&rt->im, rt->opaque, NULL);
+    if (rt->gim.img)
+        garbage_push(&rt->gim, VK_NULL_HANDLE, NULL);
     memset(rt, 0, sizeof *rt);
 }
 
@@ -4835,6 +4841,245 @@ static RenderTarget *rt_texture(const Stage *t, RenderTarget *cur, VkImageView *
     return self;
 }
 
+/* ---- BO-178: reductions read a title-size copy (Metal's rt_reduced) -----------
+ *
+ * A draw that reads a scaled target into a smaller one (nv2a_rt_reduce_draw)
+ * samples src's area average at its guest size: one full-screen triangle
+ * into src->gim, made again only when src was drawn since. Its own pipeline
+ * layout (the texture set's layout and 16 bytes of push constants), so the
+ * draws' bindings are set again after it (s_dyn_valid). */
+static VkDescriptorSet texture_set(const VkImageView v[4], const VkSampler s[4]);
+
+static const char s_vs_reduce_glsl[] =
+    "#version 450\n"
+    "void main() {\n"
+    "    vec2 t = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2);\n"
+    "    gl_Position = vec4(t * 2.0 - 1.0, 0.0, 1.0);\n"
+    "}\n";
+/* q.xy host texels per guest texel (1.5, 2, 3...), a part-covered host
+ * texel counted by its share; q.z: alpha reads 1 (a 16-bit surface). */
+static const char s_fs_reduce_glsl[] =
+    "#version 450\n"
+    "layout(set = 0, binding = 0) uniform sampler2D src;\n"
+    "layout(push_constant) uniform Q { vec4 q; } pq;\n"
+    "layout(location = 0) out vec4 o_color;\n"
+    "void main() {\n"
+    "    vec2 r = pq.q.xy, p0 = floor(gl_FragCoord.xy) * r, p1 = p0 + r;\n"
+    "    ivec2 a = ivec2(floor(p0)), b = ivec2(ceil(p1)) - 1;\n"
+    "    vec4 sum = vec4(0.0);\n"
+    "    float ws = 0.0;\n"
+    "    for (int y = a.y; y <= b.y; y++) {\n"
+    "        float wy = min(p1.y, float(y + 1)) - max(p0.y, float(y));\n"
+    "        for (int x = a.x; x <= b.x; x++) {\n"
+    "            float w = wy * (min(p1.x, float(x + 1)) - max(p0.x, float(x)));\n"
+    "            sum += texelFetch(src, ivec2(x, y), 0) * w;\n"
+    "            ws += w;\n"
+    "        }\n"
+    "    }\n"
+    "    sum = ws > 0.0 ? sum / ws : vec4(0.0);\n"
+    "    if (pq.q.z != 0.0) sum.a = 1.0;\n"
+    "    o_color = sum;\n"
+    "}\n";
+static VkPipelineLayout s_reduce_layout;
+static VkPipeline       s_reduce_pso;
+
+static int reduce_pipeline(void)
+{
+    static int failed;
+    VkShaderModule vs, fs;
+    VkPipelineLayoutCreateInfo pl;
+    VkPushConstantRange pcr;
+    VkPipelineShaderStageCreateInfo ss[2];
+    VkPipelineVertexInputStateCreateInfo vi;
+    VkPipelineInputAssemblyStateCreateInfo ia;
+    VkPipelineViewportStateCreateInfo vp;
+    VkPipelineRasterizationStateCreateInfo rs;
+    VkPipelineMultisampleStateCreateInfo ms;
+    VkPipelineDepthStencilStateCreateInfo ds;
+    VkPipelineColorBlendAttachmentState cba;
+    VkPipelineColorBlendStateCreateInfo cb;
+    VkPipelineDynamicStateCreateInfo dy;
+    VkPipelineRenderingCreateInfo pr;
+    VkGraphicsPipelineCreateInfo gp;
+    VkFormat cf = RT_FORMAT;
+    static const VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+
+    if (s_reduce_pso || failed)
+        return s_reduce_pso != VK_NULL_HANDLE;
+    failed = 1;
+    vs = module_from_glsl(NVK_STAGE_VERTEX, s_vs_reduce_glsl, "vs_reduce");
+    fs = module_from_glsl(NVK_STAGE_FRAGMENT, s_fs_reduce_glsl, "fs_reduce");
+    if (!vs || !fs)
+        goto out;
+    memset(&pcr, 0, sizeof pcr);
+    pcr.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    pcr.size = 16;
+    memset(&pl, 0, sizeof pl);
+    pl.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pl.setLayoutCount = 1;
+    pl.pSetLayouts = &s_dsl[1];
+    pl.pushConstantRangeCount = 1;
+    pl.pPushConstantRanges = &pcr;
+    if (vkCreatePipelineLayout(s_dev, &pl, NULL, &s_reduce_layout) != VK_SUCCESS)
+        goto out;
+    memset(ss, 0, sizeof ss);
+    ss[0].sType = ss[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    ss[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    ss[0].module = vs;
+    ss[0].pName = "main";
+    ss[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    ss[1].module = fs;
+    ss[1].pName = "main";
+    memset(&vi, 0, sizeof vi);
+    vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    memset(&ia, 0, sizeof ia);
+    ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    memset(&vp, 0, sizeof vp);
+    vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    vp.viewportCount = 1;
+    vp.scissorCount = 1;
+    memset(&rs, 0, sizeof rs);
+    rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.lineWidth = 1.0f;
+    memset(&ms, 0, sizeof ms);
+    ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    memset(&ds, 0, sizeof ds);
+    ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    memset(&cba, 0, sizeof cba);
+    cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
+                       | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    memset(&cb, 0, sizeof cb);
+    cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    cb.attachmentCount = 1;
+    cb.pAttachments = &cba;
+    memset(&dy, 0, sizeof dy);
+    dy.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dy.dynamicStateCount = 2;
+    dy.pDynamicStates = dyn;
+    memset(&pr, 0, sizeof pr);
+    pr.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+    pr.colorAttachmentCount = 1;
+    pr.pColorAttachmentFormats = &cf;
+    memset(&gp, 0, sizeof gp);
+    gp.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    gp.pNext = &pr;
+    gp.stageCount = 2;
+    gp.pStages = ss;
+    gp.pVertexInputState = &vi;
+    gp.pInputAssemblyState = &ia;
+    gp.pViewportState = &vp;
+    gp.pRasterizationState = &rs;
+    gp.pMultisampleState = &ms;
+    gp.pDepthStencilState = &ds;
+    gp.pColorBlendState = &cb;
+    gp.pDynamicState = &dy;
+    gp.layout = s_reduce_layout;
+    if (vkCreateGraphicsPipelines(s_dev, s_pcache, 1, &gp, NULL, &s_reduce_pso) != VK_SUCCESS)
+        s_reduce_pso = VK_NULL_HANDLE;
+    else
+        failed = 0;
+out:
+    if (vs)
+        vkDestroyShaderModule(s_dev, vs, NULL);
+    if (fs)
+        vkDestroyShaderModule(s_dev, fs, NULL);
+    if (failed)
+        XR_ERROR( LOGP "reduction pipeline failed: reductions read the host size\n");
+    return !failed;
+}
+
+/* The view of src at its guest size for a reduction, or VK_NULL_HANDLE
+ * (the draw reads src as before). `smp`: any sampler (texelFetch). */
+static VkImageView rt_reduced(RenderTarget *src, int opaque, VkSampler smp)
+{
+    VkRenderingAttachmentInfo ca;
+    VkRenderingInfo ri;
+    VkImageView v[4];
+    VkSampler sm[4];
+    VkDescriptorSet set;
+    VkViewport vpt;
+    VkRect2D sc;
+    float q[4];
+    int k;
+
+    if (!reduce_pipeline())
+        return VK_NULL_HANDLE;
+    if (src->gim.img && (src->gim.w != src->w || src->gim.h != src->h)) {
+        garbage_push(&src->gim, VK_NULL_HANDLE, NULL);   /* grown since */
+        memset(&src->gim, 0, sizeof src->gim);
+    }
+    if (src->gim.img && src->ggen == src->gen && src->gopaque == opaque)
+        return src->gim.view;
+    if (!src->gim.img
+            && !nvk_image_new(&src->gim, RT_FORMAT, src->w, src->h, 1,
+                              VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                              VK_IMAGE_ASPECT_COLOR_BIT)) {
+        memset(&src->gim, 0, sizeof src->gim);
+        return VK_NULL_HANDLE;
+    }
+    for (k = 0; k < 4; k++) {
+        v[k] = k ? s_black.view : src->im.view;
+        sm[k] = smp;
+    }
+    set = texture_set(v, sm);
+    if (!set)
+        return VK_NULL_HANDLE;
+    rt_to_sampled(&src->im);
+    end_encoder();
+    ensure_cmd();
+    nvk_image_to(s_cmd, &src->gim, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    memset(&ca, 0, sizeof ca);
+    ca.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    ca.imageView = src->gim.view;
+    ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    ca.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    memset(&ri, 0, sizeof ri);
+    ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+    ri.renderArea.extent.width = src->w;
+    ri.renderArea.extent.height = src->h;
+    ri.layerCount = 1;
+    ri.colorAttachmentCount = 1;
+    ri.pColorAttachments = &ca;
+    vkCmdBeginRendering(s_cmd, &ri);
+    vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_reduce_pso);
+    vkCmdBindDescriptorSets(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_reduce_layout, 0, 1,
+                            &set, 0, NULL);
+    q[0] = (float)src->hw / (float)src->w;
+    q[1] = (float)src->hh / (float)src->h;
+    q[2] = opaque ? 1.0f : 0.0f;
+    q[3] = 0.0f;
+    vkCmdPushConstants(s_cmd, s_reduce_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16, q);
+    memset(&vpt, 0, sizeof vpt);
+    vpt.width = (float)src->w;
+    vpt.height = (float)src->h;
+    vpt.maxDepth = 1.0f;
+    vkCmdSetViewport(s_cmd, 0, 1, &vpt);
+    memset(&sc, 0, sizeof sc);
+    sc.extent.width = src->w;
+    sc.extent.height = src->h;
+    vkCmdSetScissor(s_cmd, 0, 1, &sc);
+    vkCmdDraw(s_cmd, 3, 1, 0, 0);
+    vkCmdEndRendering(s_cmd);
+    nvk_image_to(s_cmd, &src->gim, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    s_dyn_valid = 0;            /* another pipeline, viewport and scissor bound */
+    src->ggen = src->gen;
+    src->gopaque = opaque;
+    s_reduce_made++;
+    {
+        static int said;
+        if (!said++)
+            fprintf(stderr, LOGP "surface 0x%08X (%ux%u, host %ux%u) read into a smaller"
+                    " target: at its own size (BO-178; RECOMP_DEBUG=rt_reduce=0 is the"
+                    " host size)\n", src->offset, src->w, src->h, src->hw, src->hh);
+    }
+    return src->gim.view;
+}
+
 /* ---- cube maps (BO-8): Metal's cube_bind ---------------------------------------
  *
  * A CUBEMAP stage samples a samplerCube (d3d8_combiners_glsl.c). The six
@@ -5803,6 +6048,7 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
         }
         for (k = 0; k < 4; k++) {
             const Stage *t = &s_stage[k];
+            RenderTarget *src;
             uint32_t sw, sh;
             sview[k] = s_black.view;
             ssmp[k] = sampler(t, 0, 0);
@@ -5812,7 +6058,19 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
             if (t->mode == 3 && t->cube && fmod != s_fs_basic) {   /* samplerCube */
                 sview[k] = cube_bind(t);
             } else if ((t->mode == 3 || !stage_signed(t))
-                       && rt_texture(t, rt, &sview[k], &sw, &sh) != NULL) {
+                       && (src = rt_texture(t, rt, &sview[k], &sw, &sh)) != NULL) {
+                /* BO-178: a reduction reads the title-size copy; the
+                 * coordinates below are the same for it. */
+                if (src->im.img && sview[k] != s_self.view
+                        && nv2a_rt_reduce_draw(src->w, src->h, src->hw, src->hh,
+                                               rt->w, rt->h)
+                        && nv2a_rt_reduce_on(nv2a_pb_gpu_state()->flips)) {
+                    VkImageView gv = rt_reduced(src, sview[k] == src->opaque, ssmp[k]);
+                    if (gv) {
+                        sview[k] = gv;
+                        s_reduce_binds++;
+                    }
+                }
                 if (!nv2a_tex_size_from_format(t->color)) {
                     pc.b.tex_scale[k][0] = 1.0f / (float)sw;
                     pc.b.tex_scale[k][1] = 1.0f / (float)sh;
@@ -8274,6 +8532,9 @@ static void vk_on_flip(uint32_t surface_offset, uint32_t pitch)
     flip_log(surface_offset, rt);
     if (s_presents == 1 || (s_presents % 300) == 0)
         pc_log(s_presents);
+    if ((s_presents == 1 || (s_presents % 300) == 0) && s_reduce_made)
+        fprintf(stderr, LOGP "BO-178 reductions: %llu title-size copies made, %llu binds\n",
+                (unsigned long long)s_reduce_made, (unsigned long long)s_reduce_binds);
     if (s_presents == 1 || (s_presents % 300) == 0) {
         uint64_t sh = 0, sc = 0;
         nvk_glsl_stats(&sh, &sc);
