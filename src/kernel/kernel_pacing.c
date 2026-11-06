@@ -1467,6 +1467,11 @@ int xbox_DisplayGrid(uint64_t now_ns, uint64_t *ref_ns, uint64_t *period_ns)
     return 0;
 }
 
+double xbox_DisplayModeRate(void)
+{
+    return (double)s_display_mhz / 1000.0;
+}
+
 double xbox_DisplayRate(void)
 {
     uint64_t ref, pd;

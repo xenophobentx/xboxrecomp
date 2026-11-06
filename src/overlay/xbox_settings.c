@@ -17,6 +17,7 @@
 #include "apu_xaudio2.h"
 #include "apu.h"                /* mcpx_apu_set_fx_level */
 #include "apu_bus.h"
+#include "xnet_hle.h"            /* xnet_hle_session_up: XS_OFF_ONLINE */
 
 #include <ctype.h>
 #include <math.h>
@@ -61,6 +62,7 @@ static const char *const k_lod[]      = { "off", "auto", "-0.5", "-1", "-1.5", N
 static const char *const k_lod_env[]  = { "0", "auto", "-0.5", "-1", "-1.5", NULL };
 static const char *const k_aa[]       = { "off", "fxaa", "smaa", NULL };
 static const char *const k_units[]    = { "mph", "kmh", NULL };
+static const char *const k_loadmin[]  = { "off", "3", "5", "8", "10", NULL };
 static const char *const k_face[]     = { "xbox", "nintendo", NULL };
 static const char *const k_scheme[]   = { "xbox", "ps2", NULL };
 static const char *const k_first_pad[] = { "player1", "player2", NULL };
@@ -237,6 +239,11 @@ static xs_setting s_set[XS_COUNT] = {
     [XS_AUDIO_CUSTOM_AT_START] = SETTING("audio.custom_music_at_start", XS_BOOL, 0, RENV_AUDIO_CUSTOM_AT_START, NULL, NULL, 0, 0, 1),
     /* Read by the kernel when the title asks, early in boot: a restart. */
     [XS_GAME_LANGUAGE]      = SETTING("game.language", XS_CHOICE, XS_RESTART, RENV_GAME_LANGUAGE, k_language, NULL, 0, 0, 0),
+    /* A title's own, rows only where it offers them: the simulation at the
+     * display's rate (read at start, off during an online session) and the
+     * least time a loading screen stays up (read as each one starts). */
+    [XS_GRAPHICS_NATIVE_RATE] = SETTING("graphics.native_rate", XS_BOOL, XS_RESTART | XS_OFF_ONLINE, RENV_GFX_NATIVE_RATE, NULL, NULL, 0, 0, 0),
+    [XS_GAME_LOADING_MIN]   = SETTING("game.loading_min", XS_CHOICE, 0, RENV_GAME_LOADING_MIN, k_loadmin, NULL, 0, 0, 0),
 #if defined(__ANDROID__)
     [XS_INPUT_VIBRATION]    = SETTING("input.vibration", XS_CHOICE, XS_RESTART, RENV_ANDROID_VIBRATION, k_vibration, NULL, 0, 0, 0),
     /* The on-screen controls (touch_pad.h, BO-189). Live. */
@@ -1117,7 +1124,7 @@ void xbox_SettingSet(xs_id id, double v)
     if ((unsigned)id >= XS_COUNT)
         return;
     s = &s_set[id];
-    if (s->locked)
+    if (s->locked || xbox_SettingHeldOnline(id))
         return;
     v = clampd(s, v);
     if (v == s->value && s->user)
@@ -1134,7 +1141,7 @@ void xbox_SettingReset(xs_id id)
     if ((unsigned)id >= XS_COUNT)
         return;
     s = &s_set[id];
-    if (s->locked)
+    if (s->locked || xbox_SettingHeldOnline(id))
         return;
     s->value = s->def;
     if (s->user)
@@ -1225,6 +1232,41 @@ static unsigned s_languages;
 void xbox_SettingsSetLanguages(unsigned mask)
 {
     s_languages = mask;
+}
+
+static int s_loading_min, s_native_rate;
+
+int xbox_SettingHeldOnline(xs_id id)
+{
+    return (unsigned)id < XS_COUNT && (s_set[id].flags & XS_OFF_ONLINE) && xnet_hle_session_up();
+}
+
+void xbox_SettingLock(xs_id id, const char *by)
+{
+    if ((unsigned)id < XS_COUNT) {
+        s_set[id].locked = 1;
+        s_set[id].held_by = by;
+    }
+}
+
+void xbox_SettingsSetNativeRate(int offered)
+{
+    s_native_rate = offered;
+}
+
+int xbox_SettingsNativeRate(void)
+{
+    return s_native_rate;
+}
+
+void xbox_SettingsSetLoadingMin(int offered)
+{
+    s_loading_min = offered;
+}
+
+int xbox_SettingsLoadingMin(void)
+{
+    return s_loading_min;
 }
 
 unsigned xbox_SettingsLanguages(void)

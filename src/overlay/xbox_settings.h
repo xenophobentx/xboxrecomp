@@ -43,8 +43,10 @@ typedef enum { XS_BOOL, XS_INT, XS_FLOAT, XS_CHOICE } xs_type;
 enum {
     XS_RESTART = 1,       /* read at start: a change shows after a restart */
     XS_VIRTUAL = 2,       /* several knobs (power.mode, on the Display page) */
-    XS_FROM_BOOL = 4      /* was a switch: a file's or variable's true / false
+    XS_FROM_BOOL = 4,     /* was a switch: a file's or variable's true / false
                            * still reads, as the float's 1 / 0 (BO-212) */
+    XS_OFF_ONLINE = 8     /* the title keeps it off while an online session is
+                           * up (xnet_hle_session_up): the row is locked then */
 };
 
 typedef enum {
@@ -116,6 +118,8 @@ typedef enum {
     XS_ONLINE_REACTIONS,     /* BO-352: show the quick reactions other players send, on by default; read at the start */
     XS_GAME_LANGUAGE,        /* the dashboard language the kernel reports (XC_LANGUAGE); a row only where the title has more than one */
     XS_GRAPHICS_SOFTBODY,    /* a title's soft-body vehicle damage (drawn only), off as shipped; read at start */
+    XS_GAME_LOADING_MIN,     /* the least time a loading screen stays up; a row only where the title registered it */
+    XS_GRAPHICS_NATIVE_RATE, /* the simulation at the display's rate; a row only where the title registered it; read at start; off online (XS_OFF_ONLINE) */
 #if defined(__ANDROID__)
     XS_INPUT_VIBRATION,      /* pad motors or the device's vibrator (android_vibration.c) */
     XS_INPUT_TOUCH,          /* the on-screen controls: auto / always / off (touch_pad.h) */
@@ -143,6 +147,7 @@ typedef struct xs_setting {
     double launch;                    /* when Finish ran: restart compares */
     int user;                         /* set by the file or the overlay */
     int locked;                       /* the environment sets it */
+    const char *held_by;              /* or the title holds it, for this setting (xbox_SettingLock) */
 } xs_setting;
 
 /* The save directory's settings.toml (or RECOMP_SETTINGS), read, and the
@@ -158,6 +163,14 @@ void xbox_SettingsGameDefault(const char *env_name, const char *value);
 void xbox_SettingsFinish(void);
 
 const xs_setting *xbox_SettingGet(xs_id id);
+/* The title holds a setting at the value it set (a setting another one it
+ * offers needs, as graphics.native_rate needs High refresh): its row is
+ * locked, and its hint names `by` (the row that holds it). After
+ * xbox_SettingsInit. */
+void xbox_SettingLock(xs_id id, const char *by);
+/* A setting flagged XS_OFF_ONLINE while an online session is up: the title
+ * runs it as off, and its row is locked until the session ends. */
+int    xbox_SettingHeldOnline(xs_id id);
 double xbox_SettingValue(xs_id id);
 /* Set, apply live where it can be, remember it for the file. No effect on a
  * locked setting. */
@@ -211,6 +224,14 @@ void xbox_SettingsSetBackground(int bg);
  * no row. */
 void     xbox_SettingsSetLanguages(unsigned mask);
 unsigned xbox_SettingsLanguages(void);
+/* A title that can hold its loading screen (game.loading_min) says so at
+ * start; the row shows only then. */
+void     xbox_SettingsSetLoadingMin(int offered);
+/* A title that can step its simulation at the display's rate
+ * (graphics.native_rate) says so at start; the row shows only then. */
+void     xbox_SettingsSetNativeRate(int offered);
+int      xbox_SettingsNativeRate(void);
+int      xbox_SettingsLoadingMin(void);
 
 /* The bug report's parts that come from here (xbox_report.h): settings.toml
  * attached, the settings with their sources, the shader cache's counts.

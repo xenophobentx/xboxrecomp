@@ -418,6 +418,7 @@ static const char *const n_glyphs[]    = { "Auto (the controller in use)", "Xbox
 static_assert(sizeof n_glyphs / sizeof n_glyphs[0] == XBOX_GLYPHS_MODE_COUNT + 1, "one name per glyph mode, in pad_glyphs.h order");
 static const char *const n_units[]     = { "mph (as shipped)", "km/h", NULL };
 static const char *const n_language[]  = { "English", "Japanese", "German", "French", "Spanish", "Italian", "Korean", "Chinese", "Portuguese", "Dutch", "Swedish", NULL };
+static const char *const n_loadmin[]   = { "Off (as long as it loads)", "3 s", "5 s", "8 s", "10 s", NULL };
 static const char *const n_ultrawide[] = { "Off", "21:9", "32:9", "Window", NULL };
 static const char *const n_vehicle_detail[] = { "Original", "Far (2x)", "Farthest (4x)", NULL };
 static const char *const n_scenery_detail[] = { "Original", "Far", NULL };
@@ -506,6 +507,8 @@ static constexpr Meta k_meta[XS_COUNT] = {
     /* XS_ONLINE_REACTIONS */ { XS_ONLINE_REACTIONS, "Quick reactions", "Shows the quick reactions (GG, LET'S GO! and the like) the other players send with the d-pad in the game lobby and on the results screen. Off hides them; the reactions are still sent.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_GAME_LANGUAGE */      { XS_GAME_LANGUAGE, "Language", "The language of the game's text, speech and films, as an Xbox set to that language would show them. Only the languages on your disc are offered.", 1, FMT_PLAIN, n_language, 0 },
     /* XS_GRAPHICS_SOFTBODY */  { XS_GRAPHICS_SOFTBODY, "Soft-body damage", "Cars crumple, tear and bend where they are hit, with the game's own sparks and debris where metal rips, instead of only losing panels. Drawn only: handling and the race are unchanged. Costs CPU in big pile-ups.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_GAME_LOADING_MIN */   { XS_GAME_LOADING_MIN, "Loading screens", "Keeps a race's loading screen up at least this long, for those who like to look at them. Loading itself is not slowed: the screen just stays on, at full frame rate, once the game is ready.", 1, FMT_PLAIN, n_loadmin, 0 },
+    /* XS_GRAPHICS_NATIVE_RATE */ { XS_GRAPHICS_NATIVE_RATE, "Native frame rate", "Runs the game itself at your display's refresh rate instead of 60 steps a second: every frame is a real moment of the race, not a blend of two, and the controls are read as often. Menus and loading screens too. Turns on High refresh rate, 60 fps crash cameras and Potato mode with it. Needs a machine that holds the display's rate.", 1, FMT_PLAIN, NULL, 0 },
 #if defined(__ANDROID__)
     /* XS_INPUT_VIBRATION */    { XS_INPUT_VIBRATION, "Vibration", "Where rumble goes. Auto uses this device's vibrator while its built-in controls are in use. External controllers don't rumble on Android; This device vibrates anyway.", 1, FMT_PLAIN, n_vibration, 0 },
     /* XS_INPUT_TOUCH */        { XS_INPUT_TOUCH, "Touch controls", "On-screen controls. In a race: steer with the left thumb anywhere on the left half, GAS, BRAKE and BOOST on the right (BOOST keeps accelerating). In menus: a d-pad and A B X Y. Pause and this menu are at the top, left of centre. Auto hides them while a controller is used and shows them again when you touch the screen.", 1, FMT_PLAIN, n_touch, 0 },
@@ -1468,6 +1471,8 @@ static int page_rows(int page, Row *r)
         HEAD("Frame rate");
         if (patch_on(XS_GRAPHICS_HIGH_REFRESH))
             SET(XS_GRAPHICS_HIGH_REFRESH);
+        if (xbox_SettingsNativeRate())
+            SET(XS_GRAPHICS_NATIVE_RATE);
 #if defined(__APPLE__)
         if (!s_vulkan)                 /* the Metal presenter's (BO-115) */
             SET(XS_DISPLAY_PRESENT_TIMING);
@@ -1567,6 +1572,8 @@ static int page_rows(int page, Row *r)
          * stretched (4:3 pictures take the map with them, BO-315). */
         if (patch_on(XS_DISPLAY_PICTURES) && xbox_SettingValue(XS_DISPLAY_HUD_FIX) != 0)
             SET(XS_DISPLAY_PICTURES);
+        if (xbox_SettingsLoadingMin())
+            SET(XS_GAME_LOADING_MIN);
         if (patch_on(XS_DISPLAY_CRASHNAV_MAP) && xbox_SettingValue(XS_DISPLAY_HUD_FIX) != 0 &&
             (!patch_on(XS_DISPLAY_PICTURES) || xbox_SettingValue(XS_DISPLAY_PICTURES) == 0)) {
             if (patch_on(XS_DISPLAY_PICTURES))
@@ -2113,6 +2120,8 @@ static void value_text(xs_id id, char *out, size_t n)
     const Meta &m = k_meta[id];
     double v = s->value;
 
+    if (xbox_SettingHeldOnline(id))
+        v = 0.0;                        /* off for the online session (its hint says so) */
     switch (s->type) {
     case XS_BOOL:
         snprintf(out, n, "%s", v != 0.0 ? "On" : "Off");
@@ -2189,7 +2198,7 @@ static void changed()
 static bool setting_inactive(xs_id id)
 {
     const xs_setting *s = xbox_SettingGet(id);
-    if (s->locked)
+    if (s->locked || xbox_SettingHeldOnline(id))
         return true;
     return id == XS_AUDIO_CUSTOM_AT_START && !xbox_SettingsText("audio.custom_music_dir", NULL)[0];
 }
@@ -5190,11 +5199,16 @@ static bool row_hint(const Row &r, char *hint, size_t n)
     if (r.kind == R_SETTING) {
         const xs_setting *s = xbox_SettingGet(r.id);
         locked_out = s->locked;
-        if (!s->locked && setting_inactive(r.id)) {
+        if (!s->locked && xbox_SettingHeldOnline(r.id)) {
+            locked_out = true;
+            snprintf(hint, n, "Off while you are online: every player in an online game runs the game's own 60 steps a second. It comes back after you leave online play, from the next loading screen.");
+        } else if (!s->locked && setting_inactive(r.id)) {
             locked_out = true;
             snprintf(hint, n, "Choose a music folder first (Custom music folder, above). This starts the game on the custom soundtrack you last picked.");
         } else if (s->locked) {
-            if (s->env == RENV_COUNT)
+            if (s->held_by)
+                snprintf(hint, n, "Held on by %s, which needs it; turn that off to change it here.", s->held_by);
+            else if (s->env == RENV_COUNT)
                 snprintf(hint, n, "Set by the environment (RECOMP_PRESENT_PACING / RECOMP_PRESENT_SPIN_LEAD); unset it to change it here.");
             else
                 snprintf(hint, n, "Set by the environment (%s); unset it to change it here.", recomp_env_name(s->env));

@@ -82,6 +82,9 @@ void nv2a_texup_set_scale(unsigned s) { st_texup_scale = s; }
 void nv2a_texup_set_roads(int on) { st_texup_roads = on; }
 static int st_texup_preload = -1;
 void nv2a_texup_set_preload(int on) { st_texup_preload = on; }
+/* An online session (xnet_hle.h): XS_OFF_ONLINE settings are held off. */
+static int st_session_up;
+int xnet_hle_session_up(void) { return st_session_up; }
 /* BO-136: graphics.film_upscale; the stub's machine default is Best. */
 static int st_filmup = -1;
 void nv2a_filmup_set_mode(int m) { st_filmup = m; }
@@ -137,7 +140,7 @@ static void test_restart_flags(void)
         const xs_setting *s = xbox_SettingGet((xs_id)i);
         int want = i == XS_DISPLAY_ASPECT || i == XS_GRAPHICS_RENDER_SCALE || i == XS_AUDIO_SPEAKERS
                 || i == XS_GAME_LANGUAGE || i == XS_GRAPHICS_SOFTBODY || i == XS_ONLINE_MODE
-                || i == XS_ONLINE_REACTIONS;
+                || i == XS_ONLINE_REACTIONS || i == XS_GRAPHICS_NATIVE_RATE;
 #if defined(__ANDROID__)
         want = want || i == XS_INPUT_VIBRATION;
 #endif
@@ -157,6 +160,25 @@ static void test_restart_flags(void)
  * as before: every key, and every choice's spelling in its order (the file
  * stores the spelling, the overlay the index), stays as it was. A change
  * here is a change of the file format, not of the menu. */
+/* graphics.native_rate (XS_OFF_ONLINE): no change while an online session is
+ * up, the row held; free again once it ends. */
+static void test_held_online(void)
+{
+    double was = xbox_SettingValue(XS_GRAPHICS_NATIVE_RATE);
+
+    CHECK(xbox_SettingGet(XS_GRAPHICS_NATIVE_RATE)->flags & XS_OFF_ONLINE);
+    CHECK(!xbox_SettingHeldOnline(XS_GRAPHICS_NATIVE_RATE));
+    st_session_up = 1;
+    CHECK(xbox_SettingHeldOnline(XS_GRAPHICS_NATIVE_RATE));
+    CHECK(!xbox_SettingHeldOnline(XS_GRAPHICS_HIGH_REFRESH));
+    xbox_SettingSet(XS_GRAPHICS_NATIVE_RATE, was != 0.0 ? 0.0 : 1.0);
+    CHECK(xbox_SettingValue(XS_GRAPHICS_NATIVE_RATE) == was);
+    st_session_up = 0;
+    xbox_SettingSet(XS_GRAPHICS_NATIVE_RATE, was != 0.0 ? 0.0 : 1.0);
+    CHECK(xbox_SettingValue(XS_GRAPHICS_NATIVE_RATE) != was);
+    xbox_SettingSet(XS_GRAPHICS_NATIVE_RATE, was);
+}
+
 static void test_keys_frozen(void)
 {
     static const struct { xs_id id; const char *key; const char *choices; } k[] = {
@@ -228,6 +250,8 @@ static void test_keys_frozen(void)
         { XS_GAME_LANGUAGE, "game.language", "english|japanese|german|french|spanish|italian|korean|chinese|portuguese|dutch|swedish" },
         { XS_GRAPHICS_SOFTBODY, "graphics.softbody", "" },
         { XS_INPUT_FIRST_PAD, "input.first_pad", "player1|player2" },
+        { XS_GAME_LOADING_MIN, "game.loading_min", "off|3|5|8|10" },
+        { XS_GRAPHICS_NATIVE_RATE, "graphics.native_rate", "" },
     };
     CHECK(sizeof k / sizeof k[0] == XS_COUNT
 #if defined(__ANDROID__)
@@ -339,6 +363,7 @@ int main(void)
     test_restart_flags();
     test_table_whole();
     test_keys_frozen();
+    test_held_online();
     /* A text setting: into its variable, readable, not "unknown". */
     CHECK(getenv("RECOMP_AUDIO_MUSIC_DIR")
           && !strcmp(getenv("RECOMP_AUDIO_MUSIC_DIR"), "/music/My \"Best\" \xC5\x90szi \xC5\xB1r"));

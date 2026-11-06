@@ -137,6 +137,9 @@ void xbox_PacingResetHook(void (*fn)(void));
  * the window moves to another display or the mode changes. */
 void   xbox_DisplayRateSet(double hz);
 double xbox_DisplayRate(void);
+/* The display mode's own refresh rate as the window system states it (Hz,
+ * whole numbers; 0 unknown), not the measured one: steady from the start. */
+double xbox_DisplayModeRate(void);
 
 /* A title that keeps its simulation's own clock between flips asks for its
  * flips to be held to a host grid at this rate (Hz) instead of to the swap's
