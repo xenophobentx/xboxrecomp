@@ -366,6 +366,16 @@ void xbox_OverlaySetUpdateCheck(const char *repo, const char *version);
  * run NULL, or without this call, there is none. */
 void xbox_OverlaySetSteamArt(int (*run)(char *line, unsigned n));
 
+/* The "Add languages from a European disc" row of the Game page, under
+ * Language, for a port that can add another region's language files (offered
+ * then by game.language, xbox_SettingsSetLanguages) and has a program that does
+ * it. The port registers it while some are missing. `run` is called on its own
+ * thread when the row is pressed: it opens that program and puts one line for
+ * the player in `line`; returning 2 asks for the program to be restarted
+ * (recomp_restart_request, then the ordinary quit), as the Restart game row
+ * does. With run NULL, or without this call, there is no row. */
+void xbox_OverlaySetAddLanguages(int (*run)(char *line, unsigned n));
+
 /* Ask for the overlay to open, from any thread (a host hook on the title's
  * thread: a menu entry of the game's own). It opens on the main loop's next
  * turn, as the hotkey opens it. 0 when there is no overlay to open (not

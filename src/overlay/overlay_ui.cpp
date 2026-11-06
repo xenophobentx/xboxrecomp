@@ -545,6 +545,7 @@ enum Action { A_NONE,                                               /* 0 is "no 
               A_ONLINE_SERVER,                                    /* edit the lobby server's address (BO-134) */
               A_ONLINE_CODE,                                      /* edit the game code (BO-335) */
               A_STEAM_ART,                                        /* xbox_OverlaySetSteamArt */
+              A_ADD_LANGUAGES,                                    /* xbox_OverlaySetAddLanguages */
               A_SAVE_EXPORT, A_SAVE_IMPORT, A_SAVE_BROWSE, A_SAVE_XBOX, A_SAVE_RESTORE,           /* xbox_OverlaySetSaveIO */
               A_PS2_SLOT0, A_PS2_SLOT1, A_PS2_SLOT2, A_PS2_CANCEL, A_SAVE_CANCEL,  /* BO-323: a PS2 save's profiles */
               A_CHEAT0, A_CHEAT1, A_CHEAT2, A_CHEAT3,              /* xbox_OverlaySetCheats */
@@ -1265,6 +1266,57 @@ static void steam_art_start()
     SDL_DetachThread(t);
 }
 
+/* ── Add languages (xbox_OverlaySetAddLanguages) ───────────────────── */
+
+/* As the Steam art's: the host's program starts on its own thread when the row
+ * is pressed, and its line shows from the next frame. */
+static int (*s_al_run)(char *line, unsigned n);
+static std::atomic<int> s_al_state;      /* 0 nothing asked, 1 running, 2 answered */
+static char s_al_line[240];              /* written by the thread before s_al_state is 2 */
+
+void xbox_OverlaySetAddLanguages(int (*run)(char *line, unsigned n))
+{
+    s_al_run = run;
+}
+
+static int add_languages_thread(void *)
+{
+    s_al_line[0] = 0;
+    int rc = s_al_run(s_al_line, sizeof s_al_line);
+    fprintf(stderr, LOGP "add languages: %s\n", s_al_line);
+    s_al_state.store(2, std::memory_order_release);
+    if (rc == 2) {
+        /* The program asked for the restart that makes the languages offered:
+         * as the Restart game row does, the ordinary way out with the restart
+         * asked for (SDL_PushEvent may be called from any thread). */
+        SDL_Event q;
+        recomp_restart_request("the setup window's Restart the game (languages added)");
+        memset(&q, 0, sizeof q);
+        q.type = SDL_QUIT;
+        SDL_PushEvent(&q);
+    }
+    return 0;
+}
+
+static void add_languages_start()
+{
+    int expect = 0;
+    if (!s_al_run)
+        return;
+    if (!s_al_state.compare_exchange_strong(expect, 1)) {
+        expect = 2;
+        if (!s_al_state.compare_exchange_strong(expect, 1))
+            return;
+    }
+    SDL_Thread *t = SDL_CreateThread(add_languages_thread, "add languages", NULL);
+    if (!t) {
+        snprintf(s_al_line, sizeof s_al_line, "Could not start the program.");
+        s_al_state.store(2, std::memory_order_release);
+        return;
+    }
+    SDL_DetachThread(t);
+}
+
 /* ── the shader pre-build (xbox_shader_build.h) ────────────────────── */
 
 static const xbox_shader_build_ops *s_sb;
@@ -1559,6 +1611,15 @@ static int page_rows(int page, Row *r)
             unsigned langs = xbox_SettingsLanguages();
             if (langs & (langs - 1))    /* more than one on the title's disc */
                 SET(XS_GAME_LANGUAGE);
+        }
+        /* A title that can add languages from another region's discs offers
+         * it while some are missing (xbox_OverlaySetAddLanguages). */
+        if (s_al_run) {
+            int st = s_al_state.load(std::memory_order_acquire);
+            ACT(A_ADD_LANGUAGES, st == 1 ? "The setup window is open..."
+                                         : "Add languages from a European disc");
+            if (st == 2)
+                INFO(s_al_line);
         }
         if (patch_on(XS_DISPLAY_HUD_FIX))
             SET(XS_DISPLAY_HUD_FIX);
@@ -2517,6 +2578,10 @@ static void activate_row(const Row &r)
     }
     if (r.kind == R_ACTION && r.action == A_STEAM_ART) {
         steam_art_start();
+        return;
+    }
+    if (r.kind == R_ACTION && r.action == A_ADD_LANGUAGES) {
+        add_languages_start();
         return;
     }
     if (r.kind == R_ACTION && r.action >= A_SAVE_EXPORT && r.action <= A_SAVE_CANCEL) {
@@ -5316,6 +5381,10 @@ static bool row_hint(const Row &r, char *hint, size_t n)
     } else if (r.kind == R_ACTION && r.action == A_STEAM_ART) {
         snprintf(hint, n, "Adds Steam's library pictures to the Takedawn shortcut you already have, made from your own"
                  " game files. Pictures you put there yourself are kept as backup copies. Steam can stay open.");
+    } else if (r.kind == R_ACTION && r.action == A_ADD_LANGUAGES) {
+        snprintf(hint, n, "The languages of your own European (PAL) discs of the game: French, German and Italian"
+                 " from one, Spanish, Dutch and Swedish from the other. Opens the setup window: choose a disc there"
+                 " and add them, then restart the game and pick one under Language.");
     } else if (r.kind == R_ACTION && r.action >= A_SAVE_EXPORT
                && r.action <= A_SAVE_CANCEL) {
         const char *what =
