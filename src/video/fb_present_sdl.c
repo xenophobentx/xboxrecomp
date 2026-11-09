@@ -172,6 +172,7 @@ struct fb_slot {
     uint32_t w, h, bpp;
     uint32_t flip;                 /* the walker's flip count at this frame */
     uint64_t vbl_ns;               /* its emulated vblank (kernel_pacing.h) */
+    uint32_t stereo;               /* the frame is a side-by-side pair (nv2a_pb_state.h's stereo value), 0 mono */
 };
 
 static struct fb_slot  s_slot[3];
@@ -467,6 +468,7 @@ void *xbox_FramebufferWindowBackTexture(uint32_t w, uint32_t h)
     }
     s_slot[s_back].w = w;
     s_slot[s_back].h = h;
+    s_slot[s_back].stereo = 0;
     return t;
 #else
     (void)w;
@@ -491,6 +493,11 @@ void *xbox_FramebufferWindowBackScene(uint32_t w, uint32_t h, int valid)
 }
 
 /* The back slot's blit is committed: publish it. */
+void xbox_FramebufferWindowSetStereo(uint32_t value)
+{
+    s_slot[s_back].stereo = value;
+}
+
 void xbox_FramebufferWindowPublishTexture(void)
 {
     publish(s_slot[s_back].w, s_slot[s_back].h, 4, s_tex_t0);
@@ -1639,7 +1646,7 @@ static void *present_thread(void *arg)
 #if defined(XBOXRECOMP_HAVE_VULKAN)
             if (s_vk)
                 rc = fbv_present(win, s_front, shown_seq ? f->w : 0, shown_seq ? f->h : 0,
-                                 filter, shoot ? path : NULL, shown_flip);
+                                 filter, shoot ? path : NULL, shown_flip, shown_seq ? f->stereo : 0);
 #endif
 #if defined(__APPLE__)
             if (!s_vk) {

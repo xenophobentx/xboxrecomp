@@ -476,6 +476,22 @@ extern "C" {
     X(FLIP_COST_JITTER,  DEBUG, "flip_cost_jitter", NULL,                      "=us: flip_cost spread evenly by up to this either way (default 0)") \
     X(HR_SPIN,           DEBUG, "hr_spin",         NULL,                       "=0: BO-241: while frames are held to the host grid (graphics.high_refresh) the executor spins instead of napping when idle (waiting for the title's next kick, holding a frame for its edge), so the CPU keeps its clock up; =0 naps as before (default on, with the grid only)") \
     X(PUMP_STALL_AFTER,  DEBUG, "pump_stall_after", NULL,                      "=s: seconds after the first frame before pump_stall starts (default 0)") \
+    X(VR_IPD, CONFIG, "RECOMP_VR_IPD", NULL, "VR (the game's seat camera): the distance between the eyes' cameras, millimetres (default 64); the --stereo option wins") \
+    X(VR_NEAR, CONFIG, "RECOMP_VR_NEAR", NULL, "VR (the game's seat camera): the near plane, millimetres (default 100)") \
+    X(VR_FOV, CONFIG, "RECOMP_VR_FOV", NULL, "0: VR uses the game's own field of view, not the headset's") \
+    X(VR_MENU_ASPECT, CONFIG, "RECOMP_VR_MENU_ASPECT", NULL, "VR: the shape of the screen the menus show on in the headset, width over height (default 1.42)") \
+    X(VR_HIDE_DRIVER, CONFIG, "RECOMP_VR_HIDE_DRIVER", NULL, "1: VR hides the driver's figure") \
+    X(VR_BOOSTFX, CONFIG, "RECOMP_VR_BOOSTFX", NULL, "0: VR without the boost effect") \
+    X(VR_KEEP_FX, CONFIG, "RECOMP_VR_KEEP_FX", NULL, "1: VR keeps the game's bloom and motion blur (it may come out brighter)") \
+    X(VR_ASPECT_X, CONFIG, "RECOMP_VR_ASPECT_X", NULL, "VR: stretch (+) or squeeze (-) the headset picture sideways, percent (default 0): the aspect adjust that goes with the display aspect") \
+    X(VR_ASPECT_Y, CONFIG, "RECOMP_VR_ASPECT_Y", NULL, "VR: stretch (+) or squeeze (-) the headset picture up and down, percent (default 0)") \
+    X(VR_SCREEN_X, CONFIG, "RECOMP_VR_SCREEN_X", NULL, "VR: stretch (+) or squeeze (-) the flat screen the menus, crash views and replays show on, sideways, percent (default 0)") \
+    X(VR_SCREEN_Y, CONFIG, "RECOMP_VR_SCREEN_Y", NULL, "VR: stretch (+) or squeeze (-) the flat screen up and down, percent (default 0)") \
+    X(VR_API, CONFIG, "RECOMP_VR_API", NULL, "VR: the graphics API the headset path uses: d3d11 (default) or vulkan (experimental: SteamVR crashed in xrCreateSwapchain with it on the development PC)") \
+    X(VR_SCALE, CONFIG, "RECOMP_VR_SCALE", NULL, "VR: the internal resolution (render scale 1..8) in the headset, instead of RECOMP_RENDER_SCALE (default 8)") \
+    X(VR_AA, CONFIG, "RECOMP_VR_AA", NULL, "VR: anti-aliasing in the headset, off, fxaa or smaa, instead of RECOMP_GFX_AA (default smaa)") \
+    X(VR_SHARPEN, CONFIG, "RECOMP_VR_SHARPEN", NULL, "VR: sharpening strength 0..1 in the headset, instead of RECOMP_GFX_SHARPEN (default 0)") \
+    X(VR_LOD_BIAS, CONFIG, "RECOMP_VR_LOD_BIAS", NULL, "VR: the texture LOD bias in the headset (0, auto, -0.5, -1, -1.5), instead of RECOMP_GFX_LOD_BIAS (default 0)") \
     /* ── the enhancements layer's keys (RECOMP_ENV_ENHANCE_KEYS, below) ── */ \
     RECOMP_ENV_ENHANCE_KEYS(X) \
     /* ── the game's own keys (RECOMP_ENV_GAME_KEYS, below) ──────────────── */ \

@@ -348,6 +348,7 @@ static void slow_run_end(uint32_t subch)
 static struct { uint32_t va, tag; } s_sm[SM_N];
 static volatile uint32_t s_sm_w, s_sm_r;
 static volatile uint32_t s_sm_tag;
+static volatile uint32_t s_sm_stereo;           /* the stereo channel (nv2a_pb_state.h) */
 static uint64_t s_sm_hit, s_sm_lost;
 
 void nv2a_pb_stream_mark(uint32_t va, uint32_t tag)
@@ -362,6 +363,36 @@ void nv2a_pb_stream_mark(uint32_t va, uint32_t tag)
     __atomic_store_n(&s_sm_w, w + 1, __ATOMIC_RELEASE);
 }
 uint32_t nv2a_pb_stream_tag(void) { return s_sm_tag; }
+void nv2a_pb_stream_mark_stereo(uint32_t va, uint32_t value)
+{
+    nv2a_pb_stream_mark(va, NV2A_STEREO_MARK | (value & ~NV2A_STEREO_MARK));
+}
+uint32_t nv2a_pb_stream_stereo(void) { return s_sm_stereo; }
+static float s_hide_box[6];
+static volatile int s_hide_on;
+void nv2a_pb_stream_hide_set(const float *box)
+{
+    int i;
+
+    if (!box) {
+        s_hide_on = 0;
+        return;
+    }
+    for (i = 0; i < 6; i++)
+        s_hide_box[i] = box[i];
+    s_hide_on = 1;
+}
+int nv2a_pb_stream_hide_get(float *box)
+{
+    int i;
+
+    if (!s_hide_on)
+        return 0;
+    for (i = 0; i < 6; i++)
+        box[i] = s_hide_box[i];
+    return 1;
+}
+void nv2a_pb_stream_stereo_set(uint32_t value) { s_sm_stereo = value & ~NV2A_STEREO_MARK; }
 void nv2a_pb_stream_tag_set(uint32_t tag) { s_sm_tag = tag; }
 
 /* The marks queued at `va`, applied; called with every word's address. */
@@ -370,7 +401,10 @@ static inline void sm_reach(uint32_t va)
     uint32_t r = s_sm_r;
     while (r != __atomic_load_n(&s_sm_w, __ATOMIC_ACQUIRE)
            && s_sm[r % SM_N].va == (va & SM_MASK)) {
-        s_sm_tag = s_sm[r % SM_N].tag;
+        if (s_sm[r % SM_N].tag & NV2A_STEREO_MARK)
+            s_sm_stereo = s_sm[r % SM_N].tag & ~NV2A_STEREO_MARK;
+        else
+            s_sm_tag = s_sm[r % SM_N].tag;
         r++;
         s_sm_hit++;
     }

@@ -71,6 +71,20 @@ const struct nvk_core *nvk_core_init(const char *const *inst_exts, unsigned n,
  * (the core then has none; call again later). */
 int nvk_core_replace_surface(VkSurfaceKHR (*make_surface)(VkInstance, void *), void *ctx);
 
+/* Creation hooks: a host that must make the Vulkan instance and device itself (OpenXR's XR_KHR_vulkan_enable2: the
+ * runtime adds the extensions it needs and names the GPU the headset is on) sets these before nvk_core_init. Each is
+ * optional (NULL: the usual vkCreateInstance, the best device, vkCreateDevice). create_instance and create_device get
+ * the create info the core built and return what vkCreateInstance / vkCreateDevice would; physical_device names the
+ * one device to use (NULL or VK_NULL_HANDLE: choose as usual). */
+struct nvk_create_hooks {
+    VkResult         (*create_instance)(const VkInstanceCreateInfo *ci, VkInstance *out);
+    VkPhysicalDevice (*physical_device)(VkInstance inst);
+    VkResult         (*create_device)(VkPhysicalDevice pd, const VkDeviceCreateInfo *ci, VkDevice *out);
+    /* Device extensions to enable besides the core's own, when the device has them (a headset path's external memory). */
+    const char *const *(*device_extensions)(unsigned *n);
+};
+void nvk_set_create_hooks(const struct nvk_create_hooks *h);
+
 /* The core if nvk_core_init has succeeded, else NULL. */
 const struct nvk_core *nvk_core_get(void);
 /* 1 when the device is a software renderer (llvmpipe, lavapipe, SwiftShader):

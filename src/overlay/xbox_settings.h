@@ -116,6 +116,7 @@ typedef enum {
     XS_ONLINE_REACTIONS,     /* BO-352: show the quick reactions other players send, on by default; read at the start */
     XS_GAME_LANGUAGE,        /* the dashboard language the kernel reports (XC_LANGUAGE); a row only where the title has more than one */
     XS_GRAPHICS_SOFTBODY,    /* a title's soft-body vehicle damage (drawn only), off as shipped; read at start */
+#include "xbox_settings_vr_ids.inc"         /* XS_VR_*: the VR page's settings */
 #if defined(__ANDROID__)
     XS_INPUT_VIBRATION,      /* pad motors or the device's vibrator (android_vibration.c) */
     XS_INPUT_TOUCH,          /* the on-screen controls: auto / always / off (touch_pad.h) */
@@ -150,6 +151,9 @@ typedef struct xs_setting {
  * (recomp_save_dir). Before any recomp_env lookup that matters: it ends by
  * re-reading the cached environment. */
 void xbox_SettingsInit(const char *title);
+/* One text value from the settings file, read before xbox_SettingsInit (the headset path starts before it): key as in the file
+ * ("vr.api"). Returns 1 and the text, 0 when there is none. RECOMP_SETTINGS names the file as for xbox_SettingsInit. */
+int xbox_SettingsPeek(const char *title, const char *key, char *out, unsigned n);
 /* A default the host gives a variable (its env_default); the setting's
  * "reset" value. Call after xbox_SettingsInit. */
 void xbox_SettingsGameDefault(const char *env_name, const char *value);

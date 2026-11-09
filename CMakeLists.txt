@@ -117,6 +117,18 @@ if(XR_SDL_HOST)
     endif()
 endif()
 
+# A VR headset through OpenXR (src/video/oxr.c): needs the Vulkan backend and the OpenXR headers (the Khronos SDK's
+# include directory, the one with openxr/openxr.h; tools/win/fetch-deps.sh in the game repo fetches them). The loader is
+# opened at run time, so nothing is linked and a PC without OpenXR runs as before.
+set(XBOXRECOMP_OPENXR_INCLUDE_DIR "" CACHE PATH "OpenXR SDK include directory (openxr/openxr.h): the headset output")
+if(XBOXRECOMP_HAVE_VULKAN AND XBOXRECOMP_OPENXR_INCLUDE_DIR
+        AND EXISTS "${XBOXRECOMP_OPENXR_INCLUDE_DIR}/openxr/openxr.h")
+    set(XBOXRECOMP_HAVE_OPENXR ON)
+    add_compile_definitions(XBOXRECOMP_HAVE_OPENXR=1)
+    target_include_directories(xr_vulkan INTERFACE ${XBOXRECOMP_OPENXR_INCLUDE_DIR})
+    message(STATUS "xboxrecomp: OpenXR headset output on (loaded at run time, headers ${XBOXRECOMP_OPENXR_INCLUDE_DIR})")
+endif()
+
 # The in-game settings overlay (src/overlay): Dear ImGui over the window's
 # Metal or Vulkan present, opened with Back+Start, F1 or Cmd+, ; it edits the
 # RECOMP_* settings and keeps them in settings.toml. Opt-in: it needs the

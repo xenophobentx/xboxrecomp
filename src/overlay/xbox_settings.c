@@ -60,6 +60,7 @@ static const char *const k_filmup[]   = { "off", "cheap", "best", NULL };
 static const char *const k_lod[]      = { "off", "auto", "-0.5", "-1", "-1.5", NULL };
 static const char *const k_lod_env[]  = { "0", "auto", "-0.5", "-1", "-1.5", NULL };
 static const char *const k_aa[]       = { "off", "fxaa", "smaa", NULL };
+static const char *const k_vrapi[]    = { "d3d11", "vulkan", NULL };
 static const char *const k_units[]    = { "mph", "kmh", NULL };
 static const char *const k_face[]     = { "xbox", "nintendo", NULL };
 static const char *const k_scheme[]   = { "xbox", "ps2", NULL };
@@ -229,6 +230,7 @@ static xs_setting s_set[XS_COUNT] = {
     [XS_ONLINE_MODE]        = SETTING("online.mode", XS_CHOICE, XS_RESTART, RENV_ONLINE, k_online, NULL, 0, 0, 0),
     [XS_ONLINE_REACTIONS]   = SETTING("online.reactions", XS_BOOL, XS_RESTART, RENV_ONLINE_REACTIONS, NULL, NULL, 0, 0, 1),
     [XS_GRAPHICS_SOFTBODY]  = SETTING("graphics.softbody", XS_BOOL, XS_RESTART, RENV_GFX_SOFTBODY, NULL, NULL, 0, 0, 0),
+#include "xbox_settings_vr_set.inc"       /* the VR settings (the VR page) */
     [XS_GAME_RACE_CLOCK]    = SETTING("game.race_clock", XS_BOOL, 0, RENV_GAME_RACE_CLOCK, NULL, NULL, 0, 0, 0),
     /* With a music folder set: the title starts on the custom soundtrack the
      * player last chose in its EA GAMES TRAX screen (the port does it;
@@ -969,6 +971,8 @@ static int env_real(recomp_env_id id)
     return v && *v;
 }
 
+#include "xbox_settings_vr.inc"      /* the VR picture-quality override, xbox_SettingsPeek */
+
 void xbox_SettingsInit(const char *title)
 {
     const char *over;
@@ -1030,6 +1034,7 @@ void xbox_SettingsInit(const char *title)
     for (i = 0; i < TEXT_COUNT; i++)
         if (s_text[i].user && s_text[i].val[0] && !s_text[i].locked)
             sx_setenv_keep(recomp_env_name(s_text[i].env), s_text[i].val);
+    xs_vr_after_load();         /* in VR the VR page's picture quality (xbox_settings_vr.inc) */
     /* recomp_save_dir read the table before these were set. */
     recomp_env_reload();
     XR_NOTICE( LOGP "%s\n", s_path);

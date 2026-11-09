@@ -310,6 +310,37 @@ void nv2a_pb_stream_mark(uint32_t va, uint32_t tag);
 uint32_t nv2a_pb_stream_tag(void);
 void nv2a_pb_stream_tag_set(uint32_t tag);
 
+/* The stereo channel: a second value that travels the same way (a host's VR or 3D mode). A mark whose tag has bit 31
+ * set is a stereo mark: the value is the tag's other 31 bits and the HDR tag above is left alone. 0 (the start, and
+ * after nv2a_pb_stream_stereo_set(0)) is mono. NV2A_STEREO_ON (bit 30) says that the picture is drawn once per eye,
+ * the left eye in the left half of the surface and the right in the right half, each squeezed to half its width; the
+ * low 30 bits are the shift of the left eye's image in clip space, in millionths (the right eye's is the same, the
+ * other way): K = P00 * ipd / 2 for a camera whose view-space x maps to clip x with the scale P00. A host draws
+ * the scene (the shift K) and its 2D (shift 0, the HUD at screen depth) through the same value: it marks again at the
+ * change. */
+#define NV2A_STEREO_MARK  0x80000000u
+#define NV2A_STEREO_ON    0x40000000u
+#define NV2A_STEREO_HIDE  0x00000002u    /* with NOCULL: the triangles wholly inside nv2a_pb_stream_hide_set's box are not drawn (a driver) */
+#define NV2A_STEREO_NOCULL 0x00000001u    /* the draws are made with both faces (a host's car body, seen from inside) */
+#define NV2A_STEREO_K_MASK 0x3FFFFFFFu     /* the whole payload, below */
+/* The payload: K (12 bits, in units of 2e-5, up to 0.082) and a pose id (8 bits): which of the host's recent head poses
+ * the picture was drawn from (0: none), so that the host shows the frame with that pose. K = P00 * ipd / 2 with P00 =
+ * 1 / (the camera's view window half width). */
+static inline uint32_t nv2a_stereo_pack(float k, unsigned pose_id)
+{
+    uint32_t a = (uint32_t)(k / 2e-5f + 0.5f);
+
+    return NV2A_STEREO_ON | (a > 4095u ? 4095u : a) << 18 | (pose_id & 0xFFu) << 10;
+}
+static inline float nv2a_stereo_k(uint32_t v)       { return (float)((v >> 18) & 0xFFFu) * 2e-5f; }
+static inline unsigned nv2a_stereo_pose(uint32_t v) { return (v >> 10) & 0xFFu; }
+void nv2a_pb_stream_mark_stereo(uint32_t va, uint32_t value);
+/* The box (minx, miny, minz, maxx, maxy, maxz, in the model's own space) of the NV2A_STEREO_HIDE draws; NULL clears it. */
+void nv2a_pb_stream_hide_set(const float *box);
+int nv2a_pb_stream_hide_get(float *box);
+uint32_t nv2a_pb_stream_stereo(void);
+void nv2a_pb_stream_stereo_set(uint32_t value);
+
 /* A host's own work at every flip (a title's debug monitor: Burnout 3's
  * BO3_HUD_MON walks its 2D scenes): `fn` is called on the thread that
  * executes the flip, the guest's, after the frame was presented and the

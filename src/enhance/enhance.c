@@ -15,7 +15,7 @@
 #include "../platform/xr_log.h"   /* the print gate (also force-included) */
 
 #define LOGP "[ENHANCE] "
-#define SCALE_MAX 4
+#define SCALE_MAX 8
 
 static const char *const s_filters[] = { "nearest", "linear", "integer", NULL };
 /* Indexes match XBOX_PACING_SPIN / XBOX_PACING_SLEEP. */

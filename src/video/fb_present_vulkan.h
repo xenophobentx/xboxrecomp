@@ -26,7 +26,7 @@ int   fbv_upload(int k, const uint8_t *src, uint32_t w, uint32_t h, uint32_t pit
 /* Slot k (fw x fh) into the window; 0 when no swapchain image came. Main
  * thread. */
 int   fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
-                  const char *shot_path, uint32_t flip);
+                  const char *shot_path, uint32_t flip, uint32_t stereo);
 
 /* The present timing (see fb_present_vulkan.c): a summary line now, and
  * the last displayed vblank (0 when unknown). */

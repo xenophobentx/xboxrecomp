@@ -614,6 +614,11 @@ static void ensure_cmd(void)
     if (!s_cmd) {
         s_cmd = cb_new();
         s_dyn_valid = 0;
+        if (s_cmd && s_playout) {
+            float zero[2] = { 0.0f, 0.0f };
+
+            vkCmdPushConstants(s_cmd, s_playout, VK_SHADER_STAGE_VERTEX_BIT, 0, 8, zero);
+        }
         if (s_cmd)
             texup_cmd_begin(s_cmd);   /* BO-245: the frame's GPU time */
         if (s_vf && s_vf_qp && s_cmd && s_vf->nts < VF_TS) {
@@ -1559,6 +1564,15 @@ static struct {
     uint32_t      st;
 } s_zpend;
 
+/* The stereo value of the latest stereo draw since the last flip (0: the frame is mono); handed to the window with the
+ * frame. */
+static uint32_t s_stereo_seen;
+extern void xbox_FramebufferWindowSetStereo(uint32_t value);
+
+/* The stereo helpers (below, before draw_scissor). */
+static int stereo_for(const RenderTarget *rt, float *k);
+static VkRect2D stereo_rect(const RenderTarget *rt, VkRect2D sr, int eye);
+
 static void zpend_flush(void)
 {
     if (s_zpend.rt) {
@@ -1614,12 +1628,25 @@ static void vk_on_clear(uint32_t param)
     cr.layerCount = 1;
     if (!cr.rect.extent.width || !cr.rect.extent.height)
         return;
-    if (s_occ_slot >= 0) {
-        occ_pass_end();
-        vkCmdClearAttachments(s_cmd, 1, &ca, 1, &cr);
-        occ_query_begin();
-    } else {
-        vkCmdClearAttachments(s_cmd, 1, &ca, 1, &cr);
+    {
+        float sk;
+        VkClearRect two[2];
+        uint32_t nrect = 1;
+
+        two[0] = cr;
+        if (stereo_for(rt, &sk)) {      /* both eyes' halves (their rectangles in the half each) */
+            two[0].rect = stereo_rect(rt, cr.rect, 0);
+            two[1] = cr;
+            two[1].rect = stereo_rect(rt, cr.rect, 1);
+            nrect = 2;
+        }
+        if (s_occ_slot >= 0) {
+            occ_pass_end();
+            vkCmdClearAttachments(s_cmd, 1, &ca, nrect, two);
+            occ_query_begin();
+        } else {
+            vkCmdClearAttachments(s_cmd, 1, &ca, nrect, two);
+        }
     }
     s_partial_clears++;
 }
@@ -1851,7 +1878,7 @@ static VkShaderModule vs_build(const uint32_t *slots, int n, uint32_t hash, uint
 
     snprintf(what, sizeof what, "program %08X", hash);
     d3d8_vsh_parse(slots, n, parsed);
-    if (d3d8_vsh_generate_glsl(parsed, D3D8_GLSL_SCREEN_SPACE
+    if (d3d8_vsh_generate_glsl(parsed, D3D8_GLSL_SCREEN_SPACE | D3D8_GLSL_EYE_PC
                                | (clip_range_on() ? D3D8_GLSL_CLIP_RANGE : 0u), glsl, 65536) <= 0) {
         COUNT(s_compile_errors);
         fprintf(stderr, LOGP "%s: no GLSL\n", what);
@@ -6336,6 +6363,118 @@ static int ubo_place(int which, const void *p, uint32_t n, VkDeviceSize *off)
 
 /* Metal's draw_scissor: the surface clip, clamped to rt, in host pixels
  * (xemu scissors every draw to it, pgraph/gl/draw.c). */
+/* ---- stereo: a picture drawn once per eye (nv2a_pb_state.h's stereo channel) ---------------
+ *
+ * With NV2A_STEREO_ON in the stream's stereo value, each draw to the main surface (640 x 480 or more: the
+ * view's target, not a reflection or an effect's small one) is issued twice: the left eye in the left half of the
+ * target and the right eye in the right half, each squeezed to half its width ("half side by side"). The
+ * viewport is the half and the scissor is mapped into it; the vertex stage's push constant is the eye's clip x
+ * shift, +K for the left eye (a camera that moved left sees the scene shifted right) and -K for the right.
+ * The title's own clears happen once for the whole surface and are not repeated. A pass-through batch (the HUD
+ * and menus: pre-transformed) has no push constant in its shader and is drawn flat in each half. */
+/* The HUD (a stereo value with no eye shift) is drawn smaller in each eye's half, about its middle, so that it sits in front of
+ * the player and not at the very edge of the headset's view: RECOMP_STEREO_HUD_SCALE (default 0.5; 1 leaves it), its bottom edge at RECOMP_STEREO_HUD_BOTTOM (default 0.3 of the height below the middle). */
+static float s_ui_s = 1.0f;
+static float s_ui_round = -0.3f;    /* RECOMP_STEREO_HUD_ROUND: how far the HUD's corners are pulled in (the shader's eyepc.ui) */
+static float s_ui_b = 0.3f;        /* where the HUD's bottom edge sits, as a fraction of the height below the middle */
+
+static int stereo_for(const RenderTarget *rt, float *k)
+{
+    uint32_t sv = nv2a_pb_stream_stereo();
+
+    if (!(sv & NV2A_STEREO_ON) || rt->w < 640 || rt->h < 480)
+        return 0;
+    *k = nv2a_stereo_k(sv);
+    if (*k == 0.0f) {
+        static float cfg = -1.0f;
+
+        if (cfg < 0.0f) {
+            const char *e = getenv("RECOMP_STEREO_HUD_SCALE");
+
+            cfg = e ? (float)atof(e) : 0.5f;
+            if (!(cfg >= 0.2f && cfg <= 1.0f))
+                cfg = 0.5f;
+            e = getenv("RECOMP_STEREO_HUD_ROUND");
+            if (e && *e && atof(e) > -0.8 && atof(e) < 0.8)
+                s_ui_round = (float)atof(e);
+            e = getenv("RECOMP_STEREO_HUD_BOTTOM");
+            if (e && atof(e) > 0.0 && atof(e) < 0.5)
+                s_ui_b = (float)atof(e);
+        }
+        s_ui_s = cfg;
+    } else {
+        s_ui_s = 1.0f;
+    }
+    s_stereo_seen = sv;
+    return 1;
+}
+
+/* The scissor rectangle `sr` (host pixels, the whole surface) in eye `eye`'s half. */
+static VkRect2D stereo_rect(const RenderTarget *rt, VkRect2D sr, int eye)
+{
+    uint32_t half = rt->hw / 2u;
+    uint32_t x0 = (uint32_t)sr.offset.x, x1 = x0 + sr.extent.width;
+    VkRect2D o = sr;
+
+    x0 = (uint32_t)((uint64_t)x0 * half / rt->hw);
+    x1 = (uint32_t)((uint64_t)x1 * half / rt->hw);
+    o.offset.x = (int32_t)((uint32_t)eye * half + x0);
+    o.extent.width = x1 > x0 ? x1 - x0 : 1u;
+    if (s_ui_s < 1.0f) {            /* into the smaller, centred rectangle of the HUD */
+        float s = s_ui_s, cx = (float)((uint32_t)eye * half) + 0.5f * (float)half, cy = 0.5f * (float)rt->hh;
+
+        o.offset.x = (int32_t)(cx + ((float)o.offset.x - cx) * s);
+        o.extent.width = (uint32_t)((float)o.extent.width * s) + 1u;
+        float cyc = cy + (s_ui_b - 0.5f * s) * (float)rt->hh;       /* the rectangle's middle: its bottom edge stays at s_ui_b */
+
+        o.offset.y = (int32_t)(cyc + ((float)sr.offset.y - cy) * s);
+        o.extent.height = (uint32_t)((float)sr.extent.height * s) + 1u;
+    }
+    return o;
+}
+
+static void stereo_eye(const RenderTarget *rt, VkRect2D sr, int eye, float k)
+{
+    uint32_t half = rt->hw / 2u;
+    VkViewport vp;
+    VkRect2D r = stereo_rect(rt, sr, eye);
+
+    vp.x = (float)((uint32_t)eye * half);
+    vp.y = (float)rt->hh;
+    vp.width = (float)half;
+    vp.height = -(float)rt->hh;
+    if (s_ui_s < 1.0f) {
+        float s = s_ui_s;
+
+        vp.x += 0.5f * (float)half * (1.0f - s);
+        vp.width = (float)half * s;
+        vp.y = (0.5f + s_ui_b) * (float)rt->hh;
+        vp.height = -(float)rt->hh * s;
+    }
+    vp.minDepth = 0.0f;
+    vp.maxDepth = 1.0f;
+    vkCmdSetViewport(s_cmd, 0, 1, &vp);
+    vkCmdSetScissor(s_cmd, 0, 1, &r);
+    {
+        float pc[2] = { k, 0.0f };
+
+        if (s_ui_s < 1.0f)
+            pc[1] = s_ui_round;
+        vkCmdPushConstants(s_cmd, s_playout, VK_SHADER_STAGE_VERTEX_BIT, 0, 8, pc);
+    }
+}
+
+/* After the eyes: the shift back to 0 and the cached viewport and scissor forgotten, so the next draw sets them. */
+static void stereo_done(void)
+{
+    float zero[2] = { 0.0f, 0.0f };
+
+    vkCmdPushConstants(s_cmd, s_playout, VK_SHADER_STAGE_VERTEX_BIT, 0, 8, zero);
+    s_dyn.vw = 0;
+    s_dyn.vh = 0;
+    memset(&s_dyn.sr, 0xFF, sizeof s_dyn.sr);
+}
+
 static int draw_scissor(const struct nv2a_pb_gpu *g, const RenderTarget *rt, VkRect2D *sr)
 {
     uint32_t x0 = g->clip_x, y0 = g->clip_y;
@@ -6875,6 +7014,9 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
     int cull = 0, cull_all = 0, tries;
     float zbias = 0.0f, zb_applied = 0.0f;
     int zb_split = 0;                 /* BO-253: offset on the front faces only */
+    VkRect2D draw_sr;                 /* the draw's scissor, for the stereo eyes */
+    RenderTarget *rt_pass = NULL; /* a render target a texture stage reads; a pass-through batch's, if full-size */
+    VkCullModeFlags draw_cull = 0;    /* and its cull mode */
     VkDeviceSize uo_plain = 0;        /* the vertex constants without the offset */
     uint64_t rhash = 0;               /* BO-204 debug */
     const Stage *rstage = NULL;
@@ -6910,6 +7052,27 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
     if (!d->idx_count) {
         s_draws_skipped++;
         return;
+    }
+    if ((nv2a_pb_stream_stereo() & (NV2A_STEREO_ON | NV2A_STEREO_NOCULL)) == (NV2A_STEREO_ON | NV2A_STEREO_NOCULL)) {
+        /* The host's car-body window (the player's car seen from its seat): its glass is not drawn (the blended draws; the
+         * RECOMP_STEREO_CAR_GLASS=1 setting keeps it). RECOMP_STEREO_DEBUG logs these draws. */
+        static int dbg = -1, glass = -1, nd;
+
+        if (dbg < 0) {
+            dbg = getenv("RECOMP_STEREO_DEBUG") != NULL;
+            glass = getenv("RECOMP_STEREO_CAR_GLASS") != NULL;
+        }
+        if (dbg && nd < 200) {
+            nd++;
+            fprintf(stderr, LOGP "car draw %d: %u indices, blend %d, depth %d/%d, tex0 %s 0x%08X %ux%u fmt 0x%02X, cull %d\n", nd,
+                    (unsigned)d->idx_count, (int)g->blend_enable, (int)v->depth_enable, (int)v->depth_mask,
+                    s_stage[0].mode ? "on" : "off", (unsigned)s_stage[0].offset, (unsigned)s_stage[0].width,
+                    (unsigned)s_stage[0].height, (unsigned)s_stage[0].color, 0);
+        }
+        if (g->blend_enable && !glass) {
+            s_draws_skipped++;
+            return;
+        }
     }
     if (d->program) {
         VsEntry *e = vs_cache();
@@ -7058,6 +7221,8 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
             } else if ((t->mode == 3 || !stage_signed(t))
                        && (src = rt_texture(t, rt, &sview[k], &sw, &sh)) != NULL) {
                 SPX(VKX_RTTEX);
+                if (src->w >= 640 && src->h >= 480)
+                    rt_pass = src;
                 /* BO-178: a reduction reads the title-size copy; the
                  * coordinates below are the same for it. */
                 if (src->im.img && sview[k] != s_self.view
@@ -7185,6 +7350,50 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
     } else {
         nv2a_vtx_gather(d, slot, nf4, lo, count, v->inl,
                         (const uint8_t *)xbox_GetMemoryOffset(), vf);
+        if (d->program && topo == NV2A_TOPO_TRIANGLES
+                && (nv2a_pb_stream_stereo() & (NV2A_STEREO_ON | NV2A_STEREO_NOCULL | NV2A_STEREO_HIDE))
+                   == (NV2A_STEREO_ON | NV2A_STEREO_NOCULL | NV2A_STEREO_HIDE)) {
+            /* The driver: the triangles wholly inside the box (in the model's space: the first input is the position) are
+             * dropped from the list. */
+            static int dbg = -1, nlog;
+            float bx[6];
+
+            if (dbg < 0)
+                dbg = getenv("RECOMP_STEREO_DEBUG") != NULL;
+            if (nv2a_pb_stream_hide_get(bx)) {
+                uint32_t t, kept = 0, dropped = 0;
+
+                for (t = 0; t + 2 < nidx; t += 3) {
+                    int in = 1, c;
+
+                    for (c = 0; c < 3 && in; c++) {
+                        uint32_t vi = idx[t + c];
+                        const float *pv;
+
+                        if (vi >= count) {
+                            in = 0;
+                            break;
+                        }
+                        pv = vf + (size_t)vi * nf4 * 4u;
+                        in = pv[0] >= bx[0] && pv[0] <= bx[3] && pv[1] >= bx[1] && pv[1] <= bx[4]
+                             && pv[2] >= bx[2] && pv[2] <= bx[5];
+                    }
+                    if (in) {
+                        dropped++;
+                        continue;
+                    }
+                    if (kept != t) {
+                        idx[kept] = idx[t];
+                        idx[kept + 1] = idx[t + 1];
+                        idx[kept + 2] = idx[t + 2];
+                    }
+                    kept += 3;
+                }
+                if (dbg && dropped && nlog++ < 20)
+                    fprintf(stderr, LOGP "car draw: %u of %u triangles in the driver box dropped\n", dropped, nidx / 3u);
+                nidx = kept;
+            }
+        }
         memcpy(ip, idx, (size_t)nidx * 4u);
     }
     SPM(VKS_GATHER);
@@ -7243,11 +7452,15 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
         n.vw = rt->hw;
         n.vh = rt->hh;
         n.sr = sr;
+        draw_sr = sr;
         n.front = v->front_face != 0x900 ? VK_FRONT_FACE_COUNTER_CLOCKWISE
                                          : VK_FRONT_FACE_CLOCKWISE;
         n.cull = zb_split ? VK_CULL_MODE_BACK_BIT
                : cull == 1 ? VK_CULL_MODE_BACK_BIT
                : cull == 2 ? VK_CULL_MODE_FRONT_BIT : VK_CULL_MODE_NONE;
+        /* The host's car-body mark (NV2A_STEREO_NOCULL): the body drawn with both faces, so that its inside is there. */
+        if (!zb_split && (nv2a_pb_stream_stereo() & (NV2A_STEREO_ON | NV2A_STEREO_NOCULL)) == (NV2A_STEREO_ON | NV2A_STEREO_NOCULL))
+            n.cull = VK_CULL_MODE_NONE;
         (void)nv2a_blend_constant(g->blend_enable, g->blend_sfactor,
                                   g->blend_dfactor, g->blend_color, n.bf, &(int){0});
         if (s_enc_dt && use_z)
@@ -7297,6 +7510,7 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
 #undef DYN
         s_dyn = n;
         s_dyn_valid = 1;
+        draw_cull = n.cull;
     }
     dyn_off[0] = (uint32_t)uo[0];
     dyn_off[1] = (uint32_t)uo[1];
@@ -7307,14 +7521,83 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
                             &tset, 0, NULL);
     vkCmdBindVertexBuffers(s_cmd, 0, 1, &s_ring[RING_VB].buf, &vb_off);
     vkCmdBindIndexBuffer(s_cmd, s_ring[RING_IB].buf, ib_off, VK_INDEX_TYPE_UINT32);
-    vkCmdDrawIndexed(s_cmd, nidx, 1, 0, 0, 0);
-    if (zb_split) {
-        dyn_off[1] = (uint32_t)uo_plain;
-        vkCmdBindDescriptorSets(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_playout, 0, 1,
-                                &s_set0, 3, dyn_off);
-        vkCmdSetCullMode(s_cmd, VK_CULL_MODE_FRONT_BIT);
-        s_dyn.cull = VK_CULL_MODE_FRONT_BIT;
-        vkCmdDrawIndexed(s_cmd, nidx, 1, 0, 0, 0);
+    {
+        float sk = 0.0f;
+        int eyes = stereo_for(rt, &sk) ? 2 : 1, e;
+
+        if (eyes == 2) {
+            static int dbg = -1, nd;
+
+            if (dbg < 0)
+                dbg = getenv("RECOMP_STEREO_DEBUG") != NULL;
+            if (dbg && nd < 1200 && (nd++ % 3) == 0)
+                fprintf(stderr, LOGP "stereo draw %d: rt 0x%08X %ux%u host %ux%u, %s, %u verts, scissor %d,%d %ux%u, reads rt %s\n", nd,
+                        rt->offset, rt->w, rt->h, rt->hw, rt->hh, d->program ? "program" : "pass-through", count,
+                        draw_sr.offset.x, draw_sr.offset.y, draw_sr.extent.width, draw_sr.extent.height,
+                        rt_pass ? "yes" : "no");
+        }
+        if (eyes == 2 && !d->program && count <= 6 && getenv("RECOMP_STEREO_DEBUG")) {
+            static int nq;
+
+            if (nq++ < 60) {
+                uint32_t qi;
+                int f;
+
+                fprintf(stderr, LOGP "stereo quad %d: nf4 %d, textured %d:", nq, nf4, 0);
+                for (qi = 0; qi < count; qi++) {
+                    fprintf(stderr, " v%u(", qi);
+                    for (f = 0; f < nf4 * 4 && f < 8; f++)
+                        fprintf(stderr, "%s%.1f", f ? " " : "", vf[(size_t)qi * nf4 * 4u + (size_t)f]);
+                    fprintf(stderr, ")");
+                }
+                fprintf(stderr, "\n");
+            }
+        }
+        if (eyes == 2 && rt_pass) {
+            /* A batch that reads a full-size render target (the title draws the scene into an intermediate target of the main
+             * surface's size and composites it into the main one): the picture it reads already holds both eyes, so it goes
+             * across the whole surface once. Drawn per eye it would put the pair inside each half ("stereo in stereo"). */
+            static int said;
+
+            if (said++ < 4)
+                fprintf(stderr, LOGP "stereo: a batch reads the render target 0x%08X (%ux%u) into 0x%08X (%ux%u):"
+                        " drawn once\n", rt_pass->offset, rt_pass->w, rt_pass->h, rt->offset, rt->w, rt->h);
+            eyes = 1;
+        }
+        if (eyes != 2) {
+            /* A draw with no eye shift: the push constant is set to 0 here, every time. A pass with another pipeline layout
+             * (a blur, a copy of a render target) leaves the push constants undefined once this layout is bound again, and
+             * the vertex stage adds them to every position: the picture went off the screen (a black lobby and race). */
+            static const float zero[2] = { 0.0f, 0.0f };
+
+            vkCmdPushConstants(s_cmd, s_playout, VK_SHADER_STAGE_VERTEX_BIT, 0, 8, zero);
+        }
+
+        for (e = 0; e < eyes; e++) {
+            if (eyes == 2) {
+                stereo_eye(rt, draw_sr, e, d->program ? (e ? -sk : sk) : 0.0f);
+                if (e) {        /* the first eye's second (zb_split) draw changed these */
+                    dyn_off[1] = (uint32_t)uo[1];
+                    vkCmdBindDescriptorSets(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_playout, 0, 1,
+                                            &s_set0, 3, dyn_off);
+                    vkCmdSetCullMode(s_cmd, draw_cull);
+                }
+            }
+            vkCmdDrawIndexed(s_cmd, nidx, 1, 0, 0, 0);
+            if (zb_split) {
+                dyn_off[1] = (uint32_t)uo_plain;
+                vkCmdBindDescriptorSets(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_playout, 0, 1,
+                                        &s_set0, 3, dyn_off);
+                vkCmdSetCullMode(s_cmd, VK_CULL_MODE_FRONT_BIT);
+                s_dyn.cull = VK_CULL_MODE_FRONT_BIT;
+                vkCmdDrawIndexed(s_cmd, nidx, 1, 0, 0, 0);
+            }
+        }
+        if (eyes == 2) {
+            stereo_done();
+            if (zb_split)
+                s_dyn.cull = VK_CULL_MODE_FRONT_BIT;
+        }
     }
     s_draws++;
     s_sn.draws++;
@@ -9083,6 +9366,13 @@ static int init(void)
     pl.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     pl.setLayoutCount = 2;
     pl.pSetLayouts = s_dsl;
+    {
+        /* Stereo: the eye's clip x shift (d3d8_glsl.h's D3D8_GLSL_EYE_PC). */
+        static VkPushConstantRange eye_pcr = { VK_SHADER_STAGE_VERTEX_BIT, 0, 8 };
+
+        pl.pushConstantRangeCount = 1;
+        pl.pPushConstantRanges = &eye_pcr;
+    }
     if (vkCreatePipelineLayout(s_dev, &pl, NULL, &s_playout) != VK_SUCCESS)
         return 0;
     {
@@ -9529,6 +9819,8 @@ static void vk_on_flip(uint32_t surface_offset, uint32_t pitch)
                 flush(0, FL_FLIP);
                 if (s_vf)
                     vt4 = now_ns();
+                xbox_FramebufferWindowSetStereo(s_stereo_seen);    /* a stereo pair, for a headset */
+                s_stereo_seen = 0;
                 xbox_FramebufferWindowPublishTexture();
                 if (s_vf) {
                     s_vf->f_back = vt2 - vt1;

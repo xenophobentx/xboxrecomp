@@ -323,9 +323,9 @@ static int s_activate, s_back, s_page_delta, s_reset;
  * Controls, the host's page (Mods) and System, last: LB from the first page
  * goes to System. The names are the RECOMP_OVERLAY_TEST dumps' "page" line,
  * which the scene scripts wait for. */
-enum { P_DISPLAY, P_GRAPHICS, P_GAME, P_AUDIO, P_CONTROLS, P_HOST, P_SYSTEM, P_COUNT };
+enum { P_DISPLAY, P_GRAPHICS, P_GAME, P_AUDIO, P_CONTROLS, P_VR, P_HOST, P_SYSTEM, P_COUNT };
 static const char *k_page_name[P_COUNT] = {
-    "Display", "Graphics", "Game", "Audio", "Controls", "Mods", "System"
+    "Display", "Graphics", "Game", "Audio", "Controls", "VR", "Mods", "System"
 };
 static int s_page;
 static int s_sel[P_COUNT];
@@ -375,7 +375,7 @@ static volatile uint32_t s_presents;
 
 /* ── rows ──────────────────────────────────────────────────────────── */
 
-enum { FMT_PLAIN, FMT_PERCENT, FMT_PERCENT_OF_MAX, FMT_TIMES, FMT_GAIN, FMT_NITS };
+enum { FMT_PLAIN, FMT_PERCENT, FMT_PERCENT_OF_MAX, FMT_TIMES, FMT_GAIN, FMT_NITS, FMT_RAWPCT, FMT_MM };
 
 struct Meta {
     xs_id id;                         /* its own index: checked below */
@@ -397,6 +397,7 @@ static const char *const n_fit[]       = { "Letterbox", "Fill 16:10 (crops the s
 static const char *const n_aniso[]     = { "Off", "2x", "4x", "8x", "16x", NULL };
 static const char *const n_lod[]       = { "Off", "Auto (from the render scale)", "-0.5", "-1.0", "-1.5", NULL };
 static const char *const n_aa[]        = { "Off", "FXAA", "SMAA", NULL };
+static const char *const n_vrapi[]     = { "Direct3D 11", "Vulkan (experimental)", NULL };
 static const char *const n_speakers[]  = { "Auto", "Stereo", "5.1", NULL };
 static const char *const n_custom_level[] = { "Off", "Quieter", "Match game music", "Louder", NULL };
 static const char *const n_lfe_lowpass[] = { "Off", "80 Hz", "100 Hz", "120 Hz", NULL };
@@ -506,6 +507,7 @@ static constexpr Meta k_meta[XS_COUNT] = {
     /* XS_ONLINE_REACTIONS */ { XS_ONLINE_REACTIONS, "Quick reactions", "Shows the quick reactions (GG, LET'S GO! and the like) the other players send with the d-pad in the game lobby and on the results screen. Off hides them; the reactions are still sent.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_GAME_LANGUAGE */      { XS_GAME_LANGUAGE, "Language", "The language of the game's text, speech and films, as an Xbox set to that language would show them. Only the languages on your disc are offered.", 1, FMT_PLAIN, n_language, 0 },
     /* XS_GRAPHICS_SOFTBODY */  { XS_GRAPHICS_SOFTBODY, "Soft-body damage", "Cars crumple, tear and bend where they are hit, with the game's own sparks and debris where metal rips, instead of only losing panels. Drawn only: handling and the race are unchanged. Costs CPU in big pile-ups.", 1, FMT_PLAIN, NULL, 0 },
+#include "overlay_vr_meta.inc"        /* the VR settings: labels and hints */
 #if defined(__ANDROID__)
     /* XS_INPUT_VIBRATION */    { XS_INPUT_VIBRATION, "Vibration", "Where rumble goes. Auto uses this device's vibrator while its built-in controls are in use. External controllers don't rumble on Android; This device vibrates anyway.", 1, FMT_PLAIN, n_vibration, 0 },
     /* XS_INPUT_TOUCH */        { XS_INPUT_TOUCH, "Touch controls", "On-screen controls. In a race: steer with the left thumb anywhere on the left half, GAS, BRAKE and BOOST on the right (BOOST keeps accelerating). In menus: a d-pad and A B X Y. Pause and this menu are at the top, left of centre. Auto hides them while a controller is used and shows them again when you touch the screen.", 1, FMT_PLAIN, n_touch, 0 },
@@ -1320,6 +1322,8 @@ struct Row {
     bool adv = false;                 /* an advanced row: only with "Show advanced settings" on (BO-338) */
 };
 
+#include "overlay_vr.h"               /* the VR page (overlay_vr.inc) */
+
 /* The System page's three lines on what reaches the glass (below, with
  * the frame-time graph). */
 static char s_glass_info[3][160];
@@ -1674,6 +1678,9 @@ static int page_rows(int page, Row *r)
         if (keys_shown())
             ACT(A_KEYS_PAGE, "Keyboard keys...");
         ACT(A_RESET_PAGE, "Reset this page to the defaults");
+        break;
+    case P_VR:
+        n = vr_rows(page, r);                     /* overlay_vr.inc */
         break;
     case P_HOST: {
         const int hn = hp_count();
@@ -2148,6 +2155,8 @@ static void value_text(xs_id id, char *out, size_t n)
         case FMT_PERCENT:        snprintf(out, n, "%d%%", (int)floor(v * 100.0 + 0.5)); break;
         case FMT_PERCENT_OF_MAX: snprintf(out, n, "%d%%", (int)floor(v / s->max * 100.0 + 0.5)); break;
         case FMT_TIMES:          snprintf(out, n, "%dx", (int)v); break;
+        case FMT_RAWPCT:         snprintf(out, n, "%d%%", (int)floor(v + 0.5)); break;      /* a value already in percent */
+        case FMT_MM:             snprintf(out, n, "%d mm", (int)floor(v + 0.5)); break;
         case FMT_NITS:
             {
                 /* BO-244: nits on every platform (macOS outputs HDR10 too). */
@@ -4427,6 +4436,8 @@ static void gesture_scroll()
         return;
     ImGui::SetScrollY(ImGui::GetScrollY() - ImGui::GetIO().MouseDelta.y);
 }
+
+#include "overlay_vr.inc"              /* the VR page */
 
 /* One row. `fs` is the label's size, `rh` the pitch; the columns are the
  * layout's. */
