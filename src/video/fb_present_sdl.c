@@ -1884,6 +1884,18 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     shot_parse();
 
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "nearest");
+#if defined(__APPLE__)
+    /* macOS: present.fullscreen (and the overlay's Fullscreen row) put the
+     * window in its own fullscreen Space. SDL 3's "auto" menu visibility
+     * hides the menu bar there for good when fullscreen was asked for in
+     * code rather than with the title bar's green button, so moving the
+     * pointer to the top of the screen showed nothing and Ctrl-Cmd-F was
+     * the only way out. "1" gives the usual fullscreen behaviour: the menu
+     * bar and the title bar slide down at the top edge, with the green
+     * button and Window > Exit Full Screen. The name is SDL 3's
+     * (sdl2-compat passes it through; SDL 2's headers have no macro). */
+    SDL_SetHint("SDL_VIDEO_MAC_FULLSCREEN_MENU_VISIBILITY", "1");
+#endif
 #if defined(_WIN32) && defined(SDL_HINT_WINDOWS_DPI_AWARENESS)
     /* Per-monitor (v2) DPI awareness, so that Windows does not bitmap-stretch
      * the window by the desktop's scale factor (150 % on a 4K panel: a 1280x960
