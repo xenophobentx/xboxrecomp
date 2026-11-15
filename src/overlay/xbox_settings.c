@@ -1096,6 +1096,8 @@ void xbox_SettingsFinish(void)
     xbox_InputSetGlyphMode((int)s_set[XS_INPUT_GLYPHS].value);
 #if defined(__ANDROID__)
     apply_touch();
+    if (xbox_InputTouchLayoutLoad(xbox_SettingsTouchLayoutPath()))
+        XR_NOTICE( LOGP "touch layout: %s\n", xbox_SettingsTouchLayoutPath());
 #endif
 }
 
@@ -1218,6 +1220,24 @@ int xbox_SettingsTextIsSet(const char *key)
 const char *xbox_SettingsPath(void)
 {
     return s_path;
+}
+
+const char *xbox_SettingsTouchLayoutPath(void)
+{
+    static char path[sizeof s_path + 32];
+    const char *slash = strrchr(s_path, '/');
+#if defined(_WIN32)
+    const char *bs = strrchr(s_path, '\\');
+    if (bs && (!slash || bs > slash))
+        slash = bs;
+#endif
+    if (!s_path[0])
+        return "";
+    if (!slash)
+        snprintf(path, sizeof path, "touch_layout.txt");
+    else
+        snprintf(path, sizeof path, "%.*stouch_layout.txt", (int)(slash - s_path + 1), s_path);
+    return path;
 }
 
 static unsigned s_languages;

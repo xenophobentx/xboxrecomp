@@ -10,11 +10,13 @@
  * thumb, the buttons under the right, pause and the settings menu in a
  * corner. Two layouts, picked each frame by a host hook (driving or not):
  *
- *   driving   a floating stick on the left half (it starts where the thumb
- *             lands: steering, aftertouch), GAS (right trigger) and BRAKE
- *             (left trigger) bottom right, BOOST above GAS (A; it holds the
- *             right trigger too, so one thumb boosts), BREAKER (B), LOOK
- *             (X) and VIEW (Y) smaller.
+ *   driving   a fixed steering d-pad on the left (the left stick, pushed
+ *             all the way: left and right steer, eight ways for the
+ *             aftertouch; a thumb slid from one side to the other turns
+ *             at once, with no centre that follows it), GAS (right
+ *             trigger) and BRAKE (left trigger) bottom right, BOOST above
+ *             GAS (A; it holds the right trigger too, so one thumb
+ *             boosts), BREAKER (B), LOOK (X) and VIEW (Y) smaller.
  *   menus     a fixed d-pad on the left, A B X Y as on the pad, LT and RT.
  *   both      pause (Start) and the settings menu (the overlay), at the
  *             top left of centre, clear of the HUD
@@ -22,8 +24,11 @@
  * Without a hook the menu layout is used: a whole pad, minus the sticks'
  * clicks and White/Black.
  *
+ * The player may move and resize every control of either layout (the
+ * overlay's editor, xbox_InputTouchLayout*), kept in a file of their own.
+ *
  * Every finger owns the control it went down on (multi-touch: a thumb on
- * the stick and one on GAS are independent). A finger on a button glides:
+ * the d-pad and one on GAS are independent). A finger on a button glides:
  * slid onto a neighbour it presses that one instead (PPSSPP's "glide"), and
  * slid off into the gap it keeps the one it had until it is well away. A
  * tap is held until the title has read it twice.
@@ -112,12 +117,13 @@ int  xbox_InputTouchTakeMenu(void);
 
 /* What to draw now, or 0 controls when hidden. Main thread. Re-reads the
  * driving hook, so the layout follows the title. */
-enum { XBOX_TOUCH_KIND_BUTTON, XBOX_TOUCH_KIND_STICK, XBOX_TOUCH_KIND_DPAD };
+enum { XBOX_TOUCH_KIND_BUTTON, XBOX_TOUCH_KIND_DPAD };
 enum { XBOX_TOUCH_ICON_NONE, XBOX_TOUCH_ICON_PAUSE, XBOX_TOUCH_ICON_MENU };
 typedef struct xbox_touch_draw {
+    int id;                 /* the control, for the layout editor (xbox_InputTouchLayoutMove) */
     int kind, icon;
-    float x, y, r;          /* the control's centre and radius (a stick's: its base, where it is now) */
-    float kx, ky;           /* STICK: the knob; DPAD: the held direction's unit vector, 0 0 none */
+    float x, y, r;          /* the control's centre and radius */
+    float kx, ky;           /* DPAD: the held direction, -1 0 1 on each axis (both on a diagonal), 0 0 none */
     int pressed;
     const char *label;      /* short, upper case ("GAS"), or NULL */
     uint32_t rgb;           /* 0xRRGGBB accent, 0 = plain */
@@ -126,6 +132,30 @@ typedef struct xbox_touch_draw {
 int   xbox_InputTouchDrawList(xbox_touch_draw *out, int max);
 int   xbox_InputTouchVisible(void);
 float xbox_InputTouchOpacity(void);
+
+/* The layout editor (the overlay's, main or present thread while the
+ * overlay is open: no finger is taken then). driving: 1 the race layout, 0
+ * the menus'. Positions are pixels of the screen xbox_InputTouchSetScreen
+ * gave; a size is a factor of the control's own (1 = as designed, 0.5..2.5),
+ * input.touch_scale still applying on top.
+ *
+ * List: the controls of that layout as they stand with the player's changes
+ * (none pressed). Move: one control's centre and size (kept on the screen).
+ * Size: its factor now. Reset: that layout as designed (-1: both). */
+int   xbox_InputTouchLayoutList(int driving, xbox_touch_draw *out, int max);
+void  xbox_InputTouchLayoutMove(int driving, int id, float x, float y, float size);
+float xbox_InputTouchLayoutSize(int driving, int id);
+void  xbox_InputTouchLayoutReset(int driving);
+/* The player's changes as text (one line per changed control: "race gas
+ * 0.9145 0.7000 1.20", the centre as fractions of the screen), and back:
+ * Parse replaces every change with the text's. Text returns the length (the
+ * whole text needs that + 1 bytes; out is cut short to n). */
+int   xbox_InputTouchLayoutText(char *out, int n);
+void  xbox_InputTouchLayoutParse(const char *text);
+/* The same text in a file (Save writes through <path>.tmp). 1 done, 0 not
+ * (Load: no file is the layouts as designed, and 0). */
+int   xbox_InputTouchLayoutLoad(const char *path);
+int   xbox_InputTouchLayoutSave(const char *path);
 
 /* Tests: forget everything (settings to their defaults). */
 void xbox_InputTouchReset(void);

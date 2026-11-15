@@ -508,7 +508,7 @@ static constexpr Meta k_meta[XS_COUNT] = {
     /* XS_GRAPHICS_SOFTBODY */  { XS_GRAPHICS_SOFTBODY, "Soft-body damage", "Cars crumple, tear and bend where they are hit, with the game's own sparks and debris where metal rips, instead of only losing panels. Drawn only: handling and the race are unchanged. Costs CPU in big pile-ups.", 1, FMT_PLAIN, NULL, 0 },
 #if defined(__ANDROID__)
     /* XS_INPUT_VIBRATION */    { XS_INPUT_VIBRATION, "Vibration", "Where rumble goes. Auto uses this device's vibrator while its built-in controls are in use. External controllers don't rumble on Android; This device vibrates anyway.", 1, FMT_PLAIN, n_vibration, 0 },
-    /* XS_INPUT_TOUCH */        { XS_INPUT_TOUCH, "Touch controls", "On-screen controls. In a race: steer with the left thumb anywhere on the left half, GAS, BRAKE and BOOST on the right (BOOST keeps accelerating). In menus: a d-pad and A B X Y. Pause and this menu are at the top, left of centre. Auto hides them while a controller is used and shows them again when you touch the screen.", 1, FMT_PLAIN, n_touch, 0 },
+    /* XS_INPUT_TOUCH */        { XS_INPUT_TOUCH, "Touch controls", "On-screen controls. In a race: steer with the d-pad on the left, GAS, BRAKE and BOOST on the right (BOOST keeps accelerating). In menus: a d-pad and A B X Y. Pause and this menu are at the top, left of centre. Auto hides them while a controller is used and shows them again when you touch the screen.", 1, FMT_PLAIN, n_touch, 0 },
     /* XS_INPUT_TOUCH_OPACITY */ { XS_INPUT_TOUCH_OPACITY, "Touch controls opacity", "How solid the on-screen controls look.", 0.1, FMT_PERCENT, NULL, 0 },
     /* XS_INPUT_TOUCH_SCALE */  { XS_INPUT_TOUCH_SCALE, "Touch controls size", "100% suits a phone or a 6-7 inch handheld held in both hands.", 0.1, FMT_PERCENT, NULL, 0 },
     /* XS_INPUT_TOUCH_AUTO_GAS */ { XS_INPUT_TOUCH_AUTO_GAS, "Touch: accelerate automatically", "In a race the car accelerates by itself; hold BRAKE to slow down or reverse. Touch controls only.", 1, FMT_PLAIN, NULL, 0 },
@@ -552,6 +552,7 @@ enum Action { A_NONE,                                               /* 0 is "no 
               A_HDR_RESET,                                        /* BO-110: HDR levels to the display's */
               A_KEYS_RESET,                                       /* BO-267: the keyboard keys to the defaults */
               A_KEYS_PAGE, A_KEYS_BACK,                           /* BO-338: the keyboard keys' sub-page, and back from it */
+              A_TOUCH_EDIT,                                       /* the touch controls' layout editor */
               A_RESTART_PIN, A_QUIT };       /* the two rows at the foot of every page: they ask first */
 
 /* The most rows a page has (the Audio page, with the music folder's lines
@@ -1669,6 +1670,7 @@ static int page_rows(int page, Row *r)
         SET(XS_INPUT_TOUCH);
         if ((int)xbox_SettingValue(XS_INPUT_TOUCH) != XBOX_TOUCH_OFF) {
             SUB(XS_INPUT_TOUCH_OPACITY); SUB(XS_INPUT_TOUCH_SCALE); SUB(XS_INPUT_TOUCH_AUTO_GAS);
+            ACT(A_TOUCH_EDIT, "Move and resize the touch controls...");
         }
 #endif
         if (keys_shown())
@@ -2257,6 +2259,8 @@ static void adjust(xs_id id, int dir)
 
 /* Activate: a bool flips, a choice moves on, an action runs. */
 static void mx_open();
+static void te_open();                 /* the touch layout editor (after clear_nav) */
+static void build_touch_editor();
 static bool mx_back();
 static void mx_poll();
 static void mx_ab_toggle();
@@ -2481,6 +2485,10 @@ static void activate_row(const Row &r)
         mx_open();
         return;
     }
+    if (r.kind == R_ACTION && r.action == A_TOUCH_EDIT) {
+        te_open();
+        return;
+    }
     if (r.kind == R_ADV) {
         s_adv[s_page] = !s_adv[s_page];
         s_adv_reselect = true;           /* the cursor stays on the switch (next frame's list) */
@@ -2619,6 +2627,39 @@ static void clear_nav()
     s_confirm = 0;
 }
 
+/* The touch controls' layout editor (build_touch_editor): its state, and
+ * in and out. Closed without keep: the layouts as they were when it opened. */
+static bool s_te_open;                 /* it shows instead of the pages */
+static int  s_te_lay = 1;              /* the layout shown: 1 the race's, 0 the menus' */
+static int  s_te_sel = -1;             /* the control picked (its id), -1 none */
+static bool s_te_drag;                 /* the finger that picked it is still down */
+static ImVec2 s_te_grab;               /* that finger's offset from the control's centre */
+static char s_te_undo[4096];           /* the layouts when it opened */
+static char s_te_msg[160];             /* a line instead of the help */
+
+static void te_open()
+{
+    xbox_InputTouchLayoutText(s_te_undo, sizeof s_te_undo);
+    s_te_open = true;
+    s_te_lay = 1;
+    s_te_sel = -1;
+    s_te_drag = false;
+    s_te_msg[0] = 0;
+    fprintf(stderr, LOGP "touch layout editor: open\n");
+}
+
+static void te_close(bool keep)
+{
+    if (!s_te_open)
+        return;
+    if (!keep)
+        xbox_InputTouchLayoutParse(s_te_undo);
+    s_te_open = false;
+    s_te_drag = false;
+    clear_nav();
+    fprintf(stderr, LOGP "touch layout editor: %s\n", keep ? "saved" : "cancelled");
+}
+
 /* The title is paused while the overlay is open, except on the Mixer page:
  * a mix is set by ear, so there the game keeps running and sounding (its
  * input still held: the car coasts). Nor while an online session is up
@@ -2653,6 +2694,8 @@ static void set_open(bool on, bool from_title = false)
 {
     if (on == s_open)
         return;
+    if (!on)
+        te_close(false);
     s_open = on;
     keys_cancel();
     clear_nav();
@@ -3132,7 +3175,10 @@ void xbox_OverlayPoll(void)
     pause_sync();
     if (s_back > 0) {
         s_back = 0;
-        if (s_open && s_key_cap >= 0) {
+        if (s_open && s_te_open) {
+            te_close(false);              /* B leaves the touch layout editor, unsaved */
+            menusnd_play(XBOX_OVERLAY_SND_BACK);
+        } else if (s_open && s_key_cap >= 0) {
             keys_cancel();                /* B leaves a key being picked */
             menusnd_play(XBOX_OVERLAY_SND_BACK);
         } else if (s_open && s_confirm) {
@@ -5276,6 +5322,10 @@ static bool row_hint(const Row &r, char *hint, size_t n)
         else
             snprintf(hint, n, "Rows on this page that most players never need: rarely changed, mostly for"
                      " troubleshooting. On shows them.");
+    } else if (r.kind == R_ACTION && r.action == A_TOUCH_EDIT) {
+        snprintf(hint, n, "The on-screen controls of a race and of the menus as you want them: drag each one"
+                 " where it suits your thumbs and make it larger or smaller. SAVE keeps the layout,"
+                 " RESET puts the one shown back as designed.");
     } else if (r.kind == R_ACTION && r.action == A_KEYS_PAGE) {
         snprintf(hint, n, "The keys of the keyboard for each button of the pad, two each. %s opens the list.",
                  act_name(0, true));
@@ -5729,6 +5779,11 @@ static void build_pages_inner()
 static void build_pages(float)
 {
     gesture_frame();
+    if (s_te_open) {
+        if (s_open)
+            build_touch_editor();
+        return;
+    }
     layout_compute(ImGui::GetIO().DisplaySize);
     ImGui::PushFont(nullptr, LY.label);
     build_pages_inner();
@@ -5742,8 +5797,66 @@ static ImU32 touch_col(uint32_t rgb, float a)
     return IM_COL32((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF, (int)(a * 255.0f + 0.5f));
 }
 
-/* Under everything else of the overlay's, over the game. White rings on a
- * dark wash, the accent of the button's colour, brighter while held. */
+/* One control: white rings on a dark wash, the accent of the button's
+ * colour, brighter while held. op: the opacity. */
+static void draw_touch_one(ImDrawList *dl, const xbox_touch_draw &d, float op, ImFont *font)
+{
+    const ImVec2 o(d.x, d.y);
+    const ImU32 ring = touch_col(0xFFFFFF, op * (d.pressed ? 1.0f : 0.75f));
+    const ImU32 wash = touch_col(0x000000, op * 0.45f);
+    const float th = fmaxf(2.0f, d.r * 0.05f);
+    if (d.kind == XBOX_TOUCH_KIND_DPAD) {
+        const float w = d.r * 0.34f, l = d.r;
+        for (int k = 0; k < 4; k++) {
+            const float ux = k == 0 ? -1.0f : k == 1 ? 1.0f : 0.0f;
+            const float uy = k == 2 ? -1.0f : k == 3 ? 1.0f : 0.0f;
+            /* An arm is lit when its axis is held its way (both on a
+             * diagonal of the steering d-pad). */
+            const bool held = d.pressed && ((ux != 0.0f && d.kx == ux) || (uy != 0.0f && d.ky == uy));
+            /* The arm from the centre square's edge out to l, 2w wide. */
+            const float g0 = w * 1.05f;
+            const ImVec2 a(ux ? (ux < 0 ? d.x - l : d.x + g0) : d.x - w, uy ? (uy < 0 ? d.y - l : d.y + g0) : d.y - w);
+            const ImVec2 b(ux ? (ux < 0 ? d.x - g0 : d.x + l) : d.x + w, uy ? (uy < 0 ? d.y - g0 : d.y + l) : d.y + w);
+            dl->AddRectFilled(a, b, held ? touch_col(0xFFFFFF, op * 0.6f) : wash, w * 0.35f);
+            dl->AddRect(a, b, ring, w * 0.35f, 0, th);
+            /* The arrow near the arm's end. */
+            const float tx = d.x + ux * l * 0.68f, ty = d.y + uy * l * 0.68f, t = w * 0.45f;
+            const ImU32 ac = touch_col(held ? 0x000000 : 0xFFFFFF, op * 0.9f);
+            if (ux)
+                dl->AddTriangleFilled(ImVec2(tx + ux * t, ty), ImVec2(tx - ux * t * 0.6f, ty - t),
+                                      ImVec2(tx - ux * t * 0.6f, ty + t), ac);
+            else
+                dl->AddTriangleFilled(ImVec2(tx, ty + uy * t), ImVec2(tx + t, ty - uy * t * 0.6f),
+                                      ImVec2(tx - t, ty - uy * t * 0.6f), ac);
+        }
+        return;
+    }
+    /* A button. */
+    dl->AddCircleFilled(o, d.r, d.pressed ? touch_col(d.rgb ? d.rgb : 0xFFFFFF, op * 0.65f) : wash, 40);
+    dl->AddCircle(o, d.r, d.rgb ? touch_col(d.rgb, op) : ring, 40, th);
+    const ImU32 fg = touch_col(0xFFFFFF, fminf(1.0f, op * 1.3f));
+    if (d.icon == XBOX_TOUCH_ICON_PAUSE) {
+        const float bw = d.r * 0.16f, bh = d.r * 0.45f, gap = d.r * 0.14f;
+        dl->AddRectFilled(ImVec2(d.x - gap - bw, d.y - bh), ImVec2(d.x - gap, d.y + bh), fg);
+        dl->AddRectFilled(ImVec2(d.x + gap, d.y - bh), ImVec2(d.x + gap + bw, d.y + bh), fg);
+    } else if (d.icon == XBOX_TOUCH_ICON_MENU) {
+        const float hw = d.r * 0.45f, lh = d.r * 0.10f;
+        for (int k = -1; k <= 1; k++) {
+            const float y = d.y + k * d.r * 0.30f;
+            dl->AddRectFilled(ImVec2(d.x - hw, y - lh), ImVec2(d.x + hw, y + lh), fg, lh);
+        }
+    } else if (d.label) {
+        /* As large as fits inside the circle. */
+        float size = d.r * (strlen(d.label) <= 2 ? 0.80f : 0.42f);
+        const float w1 = font->CalcTextSizeA(size, FLT_MAX, 0.0f, d.label).x;
+        if (w1 > d.r * 1.6f)
+            size *= d.r * 1.6f / w1;
+        const ImVec2 ts = font->CalcTextSizeA(size, FLT_MAX, 0.0f, d.label);
+        dl->AddText(font, size, ImVec2(d.x - ts.x * 0.5f, d.y - ts.y * 0.5f), fg, d.label);
+    }
+}
+
+/* Under everything else of the overlay's, over the game. */
 static void draw_touch(ImDrawList *dl, ImVec2 disp)
 {
     xbox_touch_draw c[XBOX_TOUCH_MAX_CONTROLS];
@@ -5759,72 +5872,179 @@ static void draw_touch(ImDrawList *dl, ImVec2 disp)
     xbox_InputTouchSetScreen(disp.x, disp.y);
     xbox_InputTouchSetDpi(display_dpi());
     n = xbox_InputTouchDrawList(c, XBOX_TOUCH_MAX_CONTROLS);
+    for (int i = 0; i < n; i++)
+        draw_touch_one(dl, c[i], op, font);
+}
+
+/* ── the touch controls' layout editor ─────────────────────────────── */
+
+/* Instead of the pages, with the title paused: either layout's controls as
+ * the player has them, a finger drags one, - and + resize the one picked;
+ * SAVE writes them (xbox_SettingsTouchLayoutPath), CANCEL or B puts back
+ * what there was, RESET the layout shown as designed (until SAVE). */
+enum { TB_RACE, TB_MENUS, TB_SMALLER, TB_SIZE, TB_BIGGER, TB_RESET, TB_CANCEL, TB_SAVE, TB_COUNT };
+
+static void te_button(int b, const xbox_touch_draw *c, int n)
+{
+    switch (b) {
+    case TB_RACE:
+    case TB_MENUS:
+        s_te_lay = b == TB_RACE;
+        s_te_sel = -1;
+        s_te_msg[0] = 0;
+        break;
+    case TB_SMALLER:
+    case TB_BIGGER:
+        for (int i = 0; i < n; i++)
+            if (c[i].id == s_te_sel) {
+                const float k = xbox_InputTouchLayoutSize(s_te_lay, s_te_sel) + (b == TB_BIGGER ? 0.1f : -0.1f);
+                xbox_InputTouchLayoutMove(s_te_lay, s_te_sel, c[i].x, c[i].y, k);
+            }
+        break;
+    case TB_RESET:
+        xbox_InputTouchLayoutReset(s_te_lay);
+        s_te_sel = -1;
+        snprintf(s_te_msg, sizeof s_te_msg, "The %s layout is back as designed. SAVE keeps it.",
+                 s_te_lay ? "race" : "menus");
+        break;
+    case TB_CANCEL:
+        te_close(false);
+        menusnd_play(XBOX_OVERLAY_SND_BACK);
+        break;
+    case TB_SAVE: {
+        const char *path = xbox_SettingsTouchLayoutPath();
+        if (xbox_InputTouchLayoutSave(path)) {
+            fprintf(stderr, LOGP "touch layout saved to %s\n", path);
+            te_close(true);
+        } else {
+            fprintf(stderr, LOGP "touch layout: cannot write %s\n", path && *path ? path : "(no settings folder)");
+            snprintf(s_te_msg, sizeof s_te_msg, "Could not save the layout.");
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+static void build_touch_editor()
+{
+    ImGuiIO &io = ImGui::GetIO();
+    const ImVec2 disp = io.DisplaySize, m = io.MousePos;
+    ImDrawList *bg = ImGui::GetBackgroundDrawList(), *fg = ImGui::GetForegroundDrawList();
+    ImFont *font = ImGui::GetFont();
+    const float dpi = display_dpi();
+    const float mm = dpi > 0.0f ? dpi / 25.4f : disp.y / 62.0f;
+    xbox_touch_draw c[XBOX_TOUCH_MAX_CONTROLS];
+    int n;
+
+    xbox_InputTouchReadInsets();
+    xbox_InputTouchSetScreen(disp.x, disp.y);
+    xbox_InputTouchSetDpi(dpi);
+    n = xbox_InputTouchLayoutList(s_te_lay, c, XBOX_TOUCH_MAX_CONTROLS);
+
+    /* The toolbar: across the middle of the screen, where no control is
+     * by design; 9 mm high (a finger's), the groups apart. */
+    char size_txt[16];
+    const char *label[TB_COUNT] = { "RACE", "MENUS", "-", size_txt, "+", "RESET", "CANCEL", "SAVE" };
+    const float bh = fmaxf(9.0f * mm, disp.y * 0.085f), ts = bh * 0.40f, pad = bh * 0.40f;
+    const float gap = bh * 0.12f, group = bh * 0.45f;
+    float bw[TB_COUNT], total = 0.0f, x;
+    ImVec2 b0[TB_COUNT], b1[TB_COUNT];
+    if (s_te_sel >= 0)
+        snprintf(size_txt, sizeof size_txt, "%d%%", (int)lrintf(xbox_InputTouchLayoutSize(s_te_lay, s_te_sel) * 100.0f));
+    else
+        snprintf(size_txt, sizeof size_txt, "SIZE");
+    for (int b = 0; b < TB_COUNT; b++) {
+        const char *w = b == TB_SIZE ? "250%" : b == TB_SMALLER || b == TB_BIGGER ? "+" : label[b];
+        bw[b] = font->CalcTextSizeA(ts, FLT_MAX, 0.0f, w).x + 2.0f * pad;
+        if (b == TB_SMALLER || b == TB_BIGGER)
+            bw[b] = bh * 1.1f;
+        total += bw[b] + (b == TB_SMALLER || b == TB_RESET || b == TB_CANCEL ? group : b ? gap : 0.0f);
+    }
+    x = (disp.x - total) * 0.5f;
+    const float y0 = disp.y * 0.42f - bh * 0.5f;
+    for (int b = 0; b < TB_COUNT; b++) {
+        x += b == TB_SMALLER || b == TB_RESET || b == TB_CANCEL ? group : b ? gap : 0.0f;
+        b0[b] = ImVec2(x, y0);
+        b1[b] = ImVec2(x + bw[b], y0 + bh);
+        x += bw[b];
+    }
+
+    /* A finger: a toolbar button, else the control under it (picked, and
+     * dragged while it stays down), else nothing picked. */
+    if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        int hitb = -1;
+        for (int b = 0; b < TB_COUNT; b++)
+            if (b != TB_SIZE && m.x >= b0[b].x && m.x <= b1[b].x && m.y >= b0[b].y && m.y <= b1[b].y)
+                hitb = b;
+        if (hitb >= 0) {
+            te_button(hitb, c, n);
+            if (!s_te_open)
+                return;
+            n = xbox_InputTouchLayoutList(s_te_lay, c, XBOX_TOUCH_MAX_CONTROLS);
+        } else {
+            int best = -1;
+            float bd = 0.0f;
+            for (int i = 0; i < n; i++) {
+                const float dx = m.x - c[i].x, dy = m.y - c[i].y, d = sqrtf(dx * dx + dy * dy) / c[i].r;
+                if (d <= 1.15f && (best < 0 || d < bd)) {
+                    best = i;
+                    bd = d;
+                }
+            }
+            s_te_sel = best >= 0 ? c[best].id : -1;
+            s_te_drag = best >= 0;
+            if (best >= 0)
+                s_te_grab = ImVec2(m.x - c[best].x, m.y - c[best].y);
+        }
+    }
+    if (s_te_drag) {
+        if (ImGui::IsMouseDown(ImGuiMouseButton_Left) && s_te_sel >= 0) {
+            xbox_InputTouchLayoutMove(s_te_lay, s_te_sel, m.x - s_te_grab.x, m.y - s_te_grab.y,
+                                      xbox_InputTouchLayoutSize(s_te_lay, s_te_sel));
+            n = xbox_InputTouchLayoutList(s_te_lay, c, XBOX_TOUCH_MAX_CONTROLS);
+        } else {
+            s_te_drag = false;
+        }
+    }
+
+    /* The game dimmed a little, the controls solid, the picked one ringed. */
+    bg->AddRectFilled(ImVec2(0, 0), disp, touch_col(0x000000, 0.40f));
     for (int i = 0; i < n; i++) {
-        const xbox_touch_draw &d = c[i];
-        const ImVec2 o(d.x, d.y);
-        const ImU32 ring = touch_col(0xFFFFFF, op * (d.pressed ? 1.0f : 0.75f));
-        const ImU32 wash = touch_col(0x000000, op * 0.45f);
-        const float th = fmaxf(2.0f, d.r * 0.05f);
-        if (d.kind == XBOX_TOUCH_KIND_STICK) {
-            dl->AddCircleFilled(o, d.r, touch_col(0x000000, op * 0.30f), 48);
-            dl->AddCircle(o, d.r, touch_col(0xFFFFFF, op * 0.55f), 48, th);
-            /* Left and right marks: it steers. */
-            const float a = d.r * 0.16f, e = d.r * 0.80f;
-            dl->AddTriangleFilled(ImVec2(d.x - e, d.y), ImVec2(d.x - e + a, d.y - a), ImVec2(d.x - e + a, d.y + a),
-                                  touch_col(0xFFFFFF, op * 0.5f));
-            dl->AddTriangleFilled(ImVec2(d.x + e, d.y), ImVec2(d.x + e - a, d.y + a), ImVec2(d.x + e - a, d.y - a),
-                                  touch_col(0xFFFFFF, op * 0.5f));
-            dl->AddCircleFilled(ImVec2(d.kx, d.ky), d.r * 0.42f,
-                                touch_col(0xFFFFFF, op * (d.pressed ? 0.75f : 0.45f)), 36);
-            continue;
+        draw_touch_one(bg, c[i], 0.9f, font);
+        if (c[i].id == s_te_sel) {
+            const ImVec2 o(c[i].x, c[i].y);
+            fg->AddCircle(o, c[i].r * 1.12f, touch_col(0xF2C31C, 1.0f), 48, fmaxf(3.0f, 0.6f * mm));
         }
-        if (d.kind == XBOX_TOUCH_KIND_DPAD) {
-            const float w = d.r * 0.34f, l = d.r;
-            for (int k = 0; k < 4; k++) {
-                const float ux = k == 0 ? -1.0f : k == 1 ? 1.0f : 0.0f;
-                const float uy = k == 2 ? -1.0f : k == 3 ? 1.0f : 0.0f;
-                const bool held = d.pressed && d.kx == ux && d.ky == uy;
-                /* The arm from the centre square's edge out to l, 2w wide. */
-                const float g0 = w * 1.05f;
-                const ImVec2 a(ux ? (ux < 0 ? d.x - l : d.x + g0) : d.x - w, uy ? (uy < 0 ? d.y - l : d.y + g0) : d.y - w);
-                const ImVec2 b(ux ? (ux < 0 ? d.x - g0 : d.x + l) : d.x + w, uy ? (uy < 0 ? d.y - g0 : d.y + l) : d.y + w);
-                dl->AddRectFilled(a, b, held ? touch_col(0xFFFFFF, op * 0.6f) : wash, w * 0.35f);
-                dl->AddRect(a, b, ring, w * 0.35f, 0, th);
-                /* The arrow near the arm's end. */
-                const float tx = d.x + ux * l * 0.68f, ty = d.y + uy * l * 0.68f, t = w * 0.45f;
-                const ImU32 ac = touch_col(held ? 0x000000 : 0xFFFFFF, op * 0.9f);
-                if (ux)
-                    dl->AddTriangleFilled(ImVec2(tx + ux * t, ty), ImVec2(tx - ux * t * 0.6f, ty - t),
-                                          ImVec2(tx - ux * t * 0.6f, ty + t), ac);
-                else
-                    dl->AddTriangleFilled(ImVec2(tx, ty + uy * t), ImVec2(tx + t, ty - uy * t * 0.6f),
-                                          ImVec2(tx - t, ty - uy * t * 0.6f), ac);
-            }
-            continue;
+    }
+
+    /* The toolbar and a line of help under it. */
+    for (int b = 0; b < TB_COUNT; b++) {
+        const bool on = (b == TB_RACE && s_te_lay) || (b == TB_MENUS && !s_te_lay);
+        const bool dim = (b == TB_SMALLER || b == TB_BIGGER || b == TB_SIZE) && s_te_sel < 0;
+        const uint32_t fill = b == TB_SAVE ? 0x2E7D32u : on ? 0x3A7BE0u : 0x1A1F29u;
+        const uint32_t text = b == TB_RESET ? 0xFF8A80u : 0xFFFFFFu;
+        const bool pressed = ImGui::IsMouseDown(ImGuiMouseButton_Left) && !s_te_drag && b != TB_SIZE
+                             && m.x >= b0[b].x && m.x <= b1[b].x && m.y >= b0[b].y && m.y <= b1[b].y;
+        if (b != TB_SIZE) {
+            fg->AddRectFilled(b0[b], b1[b], touch_col(pressed ? 0x606A7A : fill, 0.92f), bh * 0.22f);
+            fg->AddRect(b0[b], b1[b], touch_col(0xFFFFFF, dim ? 0.15f : 0.35f), bh * 0.22f, 0, fmaxf(1.0f, 0.2f * mm));
         }
-        /* A button. */
-        dl->AddCircleFilled(o, d.r, d.pressed ? touch_col(d.rgb ? d.rgb : 0xFFFFFF, op * 0.65f) : wash, 40);
-        dl->AddCircle(o, d.r, d.rgb ? touch_col(d.rgb, op) : ring, 40, th);
-        const ImU32 fg = touch_col(0xFFFFFF, fminf(1.0f, op * 1.3f));
-        if (d.icon == XBOX_TOUCH_ICON_PAUSE) {
-            const float bw = d.r * 0.16f, bh = d.r * 0.45f, gap = d.r * 0.14f;
-            dl->AddRectFilled(ImVec2(d.x - gap - bw, d.y - bh), ImVec2(d.x - gap, d.y + bh), fg);
-            dl->AddRectFilled(ImVec2(d.x + gap, d.y - bh), ImVec2(d.x + gap + bw, d.y + bh), fg);
-        } else if (d.icon == XBOX_TOUCH_ICON_MENU) {
-            const float hw = d.r * 0.45f, lh = d.r * 0.10f;
-            for (int k = -1; k <= 1; k++) {
-                const float y = d.y + k * d.r * 0.30f;
-                dl->AddRectFilled(ImVec2(d.x - hw, y - lh), ImVec2(d.x + hw, y + lh), fg, lh);
-            }
-        } else if (d.label) {
-            /* As large as fits inside the circle. */
-            float size = d.r * (strlen(d.label) <= 2 ? 0.80f : 0.42f);
-            const float w1 = font->CalcTextSizeA(size, FLT_MAX, 0.0f, d.label).x;
-            if (w1 > d.r * 1.6f)
-                size *= d.r * 1.6f / w1;
-            const ImVec2 ts = font->CalcTextSizeA(size, FLT_MAX, 0.0f, d.label);
-            dl->AddText(font, size, ImVec2(d.x - ts.x * 0.5f, d.y - ts.y * 0.5f), fg, d.label);
-        }
+        const ImVec2 t = font->CalcTextSizeA(ts, FLT_MAX, 0.0f, label[b]);
+        fg->AddText(font, ts, ImVec2((b0[b].x + b1[b].x - t.x) * 0.5f, (b0[b].y + b1[b].y - t.y) * 0.5f),
+                    touch_col(text, dim ? 0.35f : 1.0f), label[b]);
+    }
+    {
+        const char *help = s_te_msg[0] ? s_te_msg
+                         : s_te_sel >= 0 ? "Drag it where you want it; - and + change its size."
+                         : "Drag a control to move it, or tap one to resize it. SAVE keeps the layout.";
+        const float hs = ts * 0.85f;
+        const ImVec2 t = font->CalcTextSizeA(hs, FLT_MAX, 0.0f, help);
+        const ImVec2 p((disp.x - t.x) * 0.5f, y0 + bh + bh * 0.25f);
+        fg->AddRectFilled(ImVec2(p.x - hs * 0.6f, p.y - hs * 0.25f), ImVec2(p.x + t.x + hs * 0.6f, p.y + t.y + hs * 0.25f),
+                          touch_col(0x000000, 0.65f), hs * 0.3f);
+        fg->AddText(font, hs, p, touch_col(0xFFFFFF, 0.95f), help);
     }
 }
 

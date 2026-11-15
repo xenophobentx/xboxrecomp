@@ -171,6 +171,10 @@ int  xbox_SettingsNeedRestart(void);
 void xbox_SettingsFlush(void);
 /* The file in use, or "" (none). */
 const char *xbox_SettingsPath(void);
+/* The touch controls' own places and sizes (touch_pad.h, the overlay's
+ * layout editor): touch_layout.txt beside settings.toml; "" when there is no
+ * settings file. Read at xbox_SettingsInit on Android. */
+const char *xbox_SettingsTouchLayoutPath(void);
 
 /* A text setting (audio.custom_music_dir: a folder): what the file holds, or
  * the environment's when it sets the variable (*locked, may be NULL). ""
