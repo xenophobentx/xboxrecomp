@@ -9,11 +9,16 @@
  * at 90 mm (xbox_InputTouchSetDpi).
  * They keep 3.5% of the height from each edge, plus what a notch takes
  * (xbox_InputTouchSetInsets).
+ *
+ * The player's own places and sizes (the overlay's layout editor) go over
+ * the designed ones: a centre as fractions of the screen, a size as a factor
+ * of the designed one, per layout and control (g_ovr).
  */
 #include "touch_pad.h"
 
 #include <math.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -33,7 +38,7 @@ static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
  * of what the new layout does not have. */
 enum ctl_id {
     C_NONE = -1,
-    C_STICK, C_DPAD,
+    C_STEER, C_DPAD,
     C_GAS, C_BRAKE, C_BOOST, C_BREAKER, C_LOOK, C_VIEW,
     C_A, C_B, C_X, C_Y, C_LT, C_RT,
     C_PAUSE, C_MENU,
@@ -42,8 +47,15 @@ enum ctl_id {
 
 #define AN(i) (1u << (i))      /* an analog button's bit in .analog */
 
+/* The controls' names in the layout file (xbox_InputTouchLayoutText). */
+static const char *const k_name[C_COUNT] = {
+    "steer", "dpad", "gas", "brake", "boost", "breaker", "look", "view",
+    "a", "b", "x", "y", "lt", "rt", "pause", "menu"
+};
+
 typedef struct ctl {
     int id, kind, icon;
+    int steer;                  /* DPAD: the left stick, eight ways (else the d-pad's buttons, four) */
     float x, y, r;
     WORD buttons;               /* wButtons bits */
     unsigned analog;            /* AN(XBOX_BUTTON_*) bits, held at 255 */
@@ -58,7 +70,6 @@ static struct finger {
     int ctl;                    /* enum ctl_id; C_NONE: inert */
     int glide;                  /* went down on a button: may slide onto another */
     float x, y;                 /* now */
-    float cx, cy;               /* STICK: the base, where the finger landed */
     unsigned read0;             /* g_reads when it went down */
     int lift;                   /* up, held on until the title has read the press twice */
 } g_f[MAX_FINGERS];
@@ -70,6 +81,15 @@ static float g_w = 1280.0f, g_h = 720.0f;
 static float g_in[4];           /* left, top, right, bottom */
 static float g_dpi;             /* 0: unknown */
 static int   g_dirty = 1;       /* the screen or a setting changed: rebuild */
+
+/* The player's changes: [driving][control]. */
+#define LAY_SIZE_MIN 0.5f
+#define LAY_SIZE_MAX 2.5f
+static struct ovr {
+    int on;
+    float x, y;                 /* the centre, fractions of the screen */
+    float k;                    /* the size, times the designed one */
+} g_ovr[2][C_COUNT];
 
 static volatile int   g_mode = XBOX_TOUCH_OFF;
 static volatile float g_opacity = 0.5f, g_scale = 1.0f;
@@ -160,13 +180,20 @@ int xbox_InputTouchVisible(void)
 
 /* ── the layouts ──────────────────────────────────────────────────── */
 
-static void add(int id, int kind, float x, float y, float r, WORD buttons, unsigned analog,
+/* A layout being made (layout()): the controls go into out. */
+typedef struct lay {
+    ctl *out;
+    int n;
+} lay;
+
+static ctl *add(lay *L, int id, int kind, float x, float y, float r, WORD buttons, unsigned analog,
                 const char *label, uint32_t rgb, int icon)
 {
     ctl *c;
-    if (g_n >= XBOX_TOUCH_MAX_CONTROLS)
-        return;
-    c = &g_ctl[g_n++];
+    if (L->n >= XBOX_TOUCH_MAX_CONTROLS)
+        return NULL;
+    c = &L->out[L->n++];
+    memset(c, 0, sizeof *c);
     c->id = id;
     c->kind = kind;
     c->icon = icon;
@@ -177,6 +204,7 @@ static void add(int id, int kind, float x, float y, float r, WORD buttons, unsig
     c->analog = analog;
     c->label = label;
     c->rgb = rgb;
+    return c;
 }
 
 #define RGB_GREEN  0x5DBB2Eu
@@ -185,11 +213,9 @@ static void add(int id, int kind, float x, float y, float r, WORD buttons, unsig
 #define RGB_YELLOW 0xF2C31Cu
 #define RGB_ORANGE 0xFF8A1Cu
 
-/* The stick's travel, and the region of the screen it may start in. */
-static float g_stick_r, g_stick_x0, g_stick_y0, g_stick_x1, g_stick_y1;
-static float g_stick_rest_x, g_stick_rest_y;
-
-static void build(int driving)
+/* One layout as it stands now (the screen, the settings, the player's
+ * changes) into out; the count. */
+static int layout(int driving, ctl *out)
 {
     /* The height the sizes are fractions of: the screen's, at most 90 mm. */
     const float cap = g_dpi > 0.0f ? 90.0f * g_dpi / 25.4f : g_h;
@@ -198,9 +224,10 @@ static void build(int driving)
     const float m = 0.035f * base;
     const float xl = g_in[0] + m, yt = g_in[1] + m;
     const float xr = g_w - g_in[2] - m, yb = g_h - g_in[3] - m;
+    lay L = { out, 0 };
+    ctl *c;
 #define R(v) ((v) * s)
 
-    g_n = 0;
     /* Clear of the HUD's corners in every picture setup: the title's POS,
      * LAP, speedometer and boost bar sit within 0.22 H of the top and the
      * bottom of the picture, its score board within 0.21 H either side of
@@ -210,57 +237,73 @@ static void build(int driving)
 #define V(v) ((v) * g_h)
     /* Pause and the settings menu: top, left of the score board, right of
      * POS (and of where POS is in a 4:3 picture). */
-    add(C_PAUSE, XBOX_TOUCH_KIND_BUTTON, g_w * 0.5f - V(0.40f), yt + R(0.065f), R(0.055f),
+    add(&L, C_PAUSE, XBOX_TOUCH_KIND_BUTTON, g_w * 0.5f - V(0.40f), yt + R(0.065f), R(0.055f),
         XBOX_GAMEPAD_START, 0, NULL, 0, XBOX_TOUCH_ICON_PAUSE);
-    add(C_MENU, XBOX_TOUCH_KIND_BUTTON, g_w * 0.5f - V(0.27f), yt + R(0.065f), R(0.055f),
+    add(&L, C_MENU, XBOX_TOUCH_KIND_BUTTON, g_w * 0.5f - V(0.27f), yt + R(0.065f), R(0.055f),
         0, 0, NULL, 0, XBOX_TOUCH_ICON_MENU);
 
     if (driving) {
         /* The right cluster between LAP (top 0.19 H) and the speedometer
          * (bottom 0.15 H). */
-        add(C_GAS, XBOX_TOUCH_KIND_BUTTON, xr - R(0.15f), V(0.70f), R(0.12f),
+        add(&L, C_GAS, XBOX_TOUCH_KIND_BUTTON, xr - R(0.15f), V(0.70f), R(0.12f),
             0, AN(XBOX_BUTTON_RTRIGGER), "GAS", RGB_GREEN, 0);
-        add(C_BRAKE, XBOX_TOUCH_KIND_BUTTON, xr - R(0.41f), V(0.74f), R(0.09f),
+        add(&L, C_BRAKE, XBOX_TOUCH_KIND_BUTTON, xr - R(0.41f), V(0.74f), R(0.09f),
             0, AN(XBOX_BUTTON_LTRIGGER), "BRAKE", RGB_RED, 0);
         /* Boost is A with the accelerator still down: one thumb. */
-        add(C_BOOST, XBOX_TOUCH_KIND_BUTTON, xr - R(0.15f), V(0.45f), R(0.10f),
+        add(&L, C_BOOST, XBOX_TOUCH_KIND_BUTTON, xr - R(0.15f), V(0.45f), R(0.10f),
             0, AN(XBOX_BUTTON_A) | AN(XBOX_BUTTON_RTRIGGER), "BOOST", RGB_ORANGE, 0);
-        add(C_BREAKER, XBOX_TOUCH_KIND_BUTTON, xr - R(0.40f), V(0.52f), R(0.075f),
+        add(&L, C_BREAKER, XBOX_TOUCH_KIND_BUTTON, xr - R(0.40f), V(0.52f), R(0.075f),
             0, AN(XBOX_BUTTON_B), "BREAKER", 0, 0);
-        add(C_LOOK, XBOX_TOUCH_KIND_BUTTON, xr - R(0.38f), V(0.31f), R(0.065f),
+        add(&L, C_LOOK, XBOX_TOUCH_KIND_BUTTON, xr - R(0.38f), V(0.31f), R(0.065f),
             0, AN(XBOX_BUTTON_X), "LOOK", 0, 0);
-        add(C_VIEW, XBOX_TOUCH_KIND_BUTTON, xr - R(0.15f), V(0.26f), R(0.06f),
+        add(&L, C_VIEW, XBOX_TOUCH_KIND_BUTTON, xr - R(0.15f), V(0.26f), R(0.06f),
             0, AN(XBOX_BUTTON_Y), "VIEW", 0, 0);
-        /* The stick floats: it starts where the thumb lands, anywhere on
-         * the left half below the top buttons. Drawn at rest above the
-         * boost bar. */
-        g_stick_r = R(0.15f);
-        g_stick_rest_x = xl + R(0.22f);
-        g_stick_rest_y = V(0.66f);
-        g_stick_x0 = xl;
-        g_stick_x1 = g_w * 0.5f;
-        g_stick_y0 = yt + R(0.16f);
-        g_stick_y1 = g_h;
-        add(C_STICK, XBOX_TOUCH_KIND_STICK, g_stick_rest_x, g_stick_rest_y, g_stick_r,
-            0, 0, NULL, 0, 0);
+        /* Steering: a d-pad that stays where it is drawn, above the boost
+         * bar. Its centre never moves, so a thumb that lands right of it
+         * steers right, and slid across steers left at once. */
+        c = add(&L, C_STEER, XBOX_TOUCH_KIND_DPAD, xl + R(0.25f), V(0.64f), R(0.19f),
+                0, 0, NULL, 0, 0);
+        if (c)
+            c->steer = 1;
     } else {
-        add(C_DPAD, XBOX_TOUCH_KIND_DPAD, xl + R(0.25f), yb - R(0.25f), R(0.22f),
+        add(&L, C_DPAD, XBOX_TOUCH_KIND_DPAD, xl + R(0.25f), yb - R(0.25f), R(0.22f),
             0, 0, NULL, 0, 0);
-        add(C_A, XBOX_TOUCH_KIND_BUTTON, xr - R(0.22f), yb - R(0.10f), R(0.08f),
+        add(&L, C_A, XBOX_TOUCH_KIND_BUTTON, xr - R(0.22f), yb - R(0.10f), R(0.08f),
             0, AN(XBOX_BUTTON_A), "A", RGB_GREEN, 0);
-        add(C_B, XBOX_TOUCH_KIND_BUTTON, xr - R(0.08f), yb - R(0.24f), R(0.08f),
+        add(&L, C_B, XBOX_TOUCH_KIND_BUTTON, xr - R(0.08f), yb - R(0.24f), R(0.08f),
             0, AN(XBOX_BUTTON_B), "B", RGB_RED, 0);
-        add(C_X, XBOX_TOUCH_KIND_BUTTON, xr - R(0.36f), yb - R(0.24f), R(0.08f),
+        add(&L, C_X, XBOX_TOUCH_KIND_BUTTON, xr - R(0.36f), yb - R(0.24f), R(0.08f),
             0, AN(XBOX_BUTTON_X), "X", RGB_BLUE, 0);
-        add(C_Y, XBOX_TOUCH_KIND_BUTTON, xr - R(0.22f), yb - R(0.38f), R(0.08f),
+        add(&L, C_Y, XBOX_TOUCH_KIND_BUTTON, xr - R(0.22f), yb - R(0.38f), R(0.08f),
             0, AN(XBOX_BUTTON_Y), "Y", RGB_YELLOW, 0);
-        add(C_LT, XBOX_TOUCH_KIND_BUTTON, xl + R(0.10f), yb - R(0.62f), R(0.07f),
+        add(&L, C_LT, XBOX_TOUCH_KIND_BUTTON, xl + R(0.10f), yb - R(0.62f), R(0.07f),
             0, AN(XBOX_BUTTON_LTRIGGER), "LT", 0, 0);
-        add(C_RT, XBOX_TOUCH_KIND_BUTTON, xr - R(0.10f), yb - R(0.62f), R(0.07f),
+        add(&L, C_RT, XBOX_TOUCH_KIND_BUTTON, xr - R(0.10f), yb - R(0.62f), R(0.07f),
             0, AN(XBOX_BUTTON_RTRIGGER), "RT", 0, 0);
     }
 #undef V
 #undef R
+
+    /* The player's places and sizes, each control kept whole on the screen. */
+    for (int i = 0; i < L.n; i++) {
+        const struct ovr *o = &g_ovr[driving != 0][out[i].id];
+        c = &out[i];
+        if (o->on) {
+            c->x = o->x * g_w;
+            c->y = o->y * g_h;
+            c->r *= o->k;
+        }
+        if (2.0f * c->r < g_w)
+            c->x = c->x < c->r ? c->r : c->x > g_w - c->r ? g_w - c->r : c->x;
+        if (2.0f * c->r < g_h)
+            c->y = c->y < c->r ? c->r : c->y > g_h - c->r ? g_h - c->r : c->y;
+    }
+    return L.n;
+}
+
+static void build(int driving)
+{
+    g_n = layout(driving, g_ctl);
 }
 
 static const ctl *find(int id)
@@ -298,37 +341,29 @@ static float dist(float ax, float ay, float bx, float by)
     return sqrtf(dx * dx + dy * dy);
 }
 
-/* The d-pad's direction from the centre: the dominant axis only (a menu
- * wants no diagonals), nothing in the middle fifth. */
+/* The d-pad's direction from the centre, nothing in the middle fifth. The
+ * menus' takes the dominant axis only (a menu wants no diagonals); the
+ * steering one has eight ways: an axis counts within 67.5 degrees of it, so
+ * a thumb a little off left still steers fully left. *ux, *uy: -1 0 1. */
 static WORD dpad_dir(const ctl *c, float x, float y, float *ux, float *uy)
 {
     float dx = x - c->x, dy = y - c->y;
     *ux = *uy = 0.0f;
     if (dist(x, y, c->x, c->y) < c->r * 0.2f)
         return 0;
+    if (c->steer) {
+        if (fabsf(dy) < fabsf(dx) * 2.4142f)
+            *ux = dx < 0 ? -1.0f : 1.0f;
+        if (fabsf(dx) < fabsf(dy) * 2.4142f)
+            *uy = dy < 0 ? -1.0f : 1.0f;
+        return 0;
+    }
     if (fabsf(dx) >= fabsf(dy)) {
         *ux = dx < 0 ? -1.0f : 1.0f;
         return dx < 0 ? XBOX_GAMEPAD_DPAD_LEFT : XBOX_GAMEPAD_DPAD_RIGHT;
     }
     *uy = dy < 0 ? -1.0f : 1.0f;
     return dy < 0 ? XBOX_GAMEPAD_DPAD_UP : XBOX_GAMEPAD_DPAD_DOWN;
-}
-
-/* The stick's deflection, -1..1 each way within the unit circle, with a
- * small dead centre. */
-static void stick_vec(const struct finger *f, float *vx, float *vy)
-{
-    float dx = (f->x - f->cx) / g_stick_r, dy = (f->y - f->cy) / g_stick_r;
-    float mag = sqrtf(dx * dx + dy * dy);
-    *vx = *vy = 0.0f;
-    if (mag < 0.08f)
-        return;
-    {
-        float k = (mag > 1.0f ? 1.0f : mag);
-        k = (k - 0.08f) / 0.92f / mag;
-        *vx = dx * k;
-        *vy = dy * k;
-    }
 }
 
 static SHORT axis(float v)
@@ -352,14 +387,13 @@ static void publish(void)
             const ctl *c;
             if (!f->used || f->ctl == C_NONE || !(c = find(f->ctl)))
                 continue;
-            if (c->kind == XBOX_TOUCH_KIND_STICK) {
-                float vx, vy;
-                stick_vec(f, &vx, &vy);
-                g.sThumbLX = axis(vx);
-                g.sThumbLY = axis(-vy);        /* up is positive on the pad */
-            } else if (c->kind == XBOX_TOUCH_KIND_DPAD) {
+            if (c->kind == XBOX_TOUCH_KIND_DPAD) {
                 float ux, uy;
                 g.wButtons |= dpad_dir(c, f->x, f->y, &ux, &uy);
+                if (c->steer) {
+                    g.sThumbLX = axis(ux);
+                    g.sThumbLY = axis(-uy);    /* up is positive on the pad */
+                }
             } else {
                 g.wButtons |= c->buttons;
                 for (int b = 0; b < 8; b++)
@@ -406,8 +440,8 @@ int xbox_InputTouchTakeMenu(void)
 
 /* ── fingers ──────────────────────────────────────────────────────── */
 
-/* The button (or d-pad) under a point: the nearest whose circle, made
- * `slack` times larger, holds it. */
+/* The control under a point: the nearest whose circle, made `slack` times
+ * larger, holds it. */
 static const ctl *hit(float x, float y, float slack, int buttons_only)
 {
     const ctl *best = NULL;
@@ -415,8 +449,6 @@ static const ctl *hit(float x, float y, float slack, int buttons_only)
     for (int i = 0; i < g_n; i++) {
         const ctl *c = &g_ctl[i];
         float d;
-        if (c->kind == XBOX_TOUCH_KIND_STICK)
-            continue;
         if (buttons_only && c->kind != XBOX_TOUCH_KIND_BUTTON)
             continue;
         d = dist(x, y, c->x, c->y);
@@ -476,13 +508,6 @@ void xbox_InputTouchFinger(int what, int64_t id, float x, float y)
             f->ctl = c->id;
             f->glide = c->kind == XBOX_TOUCH_KIND_BUTTON;
             press(c);
-        } else if (g_driving == 1 && x >= g_stick_x0 && x < g_stick_x1
-                   && y >= g_stick_y0 && y <= g_stick_y1) {
-            /* The base where the thumb landed, kept whole on the screen. */
-            float r = g_stick_r;
-            f->ctl = C_STICK;
-            f->cx = x < g_stick_x0 + r ? g_stick_x0 + r : x;
-            f->cy = y > g_h - g_in[3] - r ? g_h - g_in[3] - r : y;
         }
     } else if (!f) {
         return;
@@ -508,7 +533,7 @@ void xbox_InputTouchFinger(int what, int64_t id, float x, float y)
         /* A tap shorter than two of the title's reads would be missed (it
          * polls once a frame): the press is held until it has been read. */
         const ctl *c = f->ctl != C_NONE ? find(f->ctl) : NULL;
-        if (c && c->kind != XBOX_TOUCH_KIND_STICK && g_reads - f->read0 < 2)
+        if (c && g_reads - f->read0 < 2)
             f->lift = 1;
         else
             f->used = 0;
@@ -552,13 +577,12 @@ int xbox_InputTouchDrawList(xbox_touch_draw *out, int max)
         const ctl *c = &g_ctl[i];
         xbox_touch_draw *d = &out[n++];
         memset(d, 0, sizeof *d);
+        d->id = c->id;
         d->kind = c->kind;
         d->icon = c->icon;
         d->x = c->x;
         d->y = c->y;
         d->r = c->r;
-        d->kx = c->x;
-        d->ky = c->y;
         d->label = c->label;
         d->rgb = c->rgb;
         for (int k = 0; k < MAX_FINGERS; k++) {
@@ -566,20 +590,10 @@ int xbox_InputTouchDrawList(xbox_touch_draw *out, int max)
             if (!f->used || f->ctl != c->id)
                 continue;
             d->pressed = 1;
-            if (c->kind == XBOX_TOUCH_KIND_STICK) {
-                float dx = f->x - f->cx, dy = f->y - f->cy;
-                float mag = sqrtf(dx * dx + dy * dy);
-                d->x = f->cx;
-                d->y = f->cy;
-                if (mag > c->r) {
-                    dx *= c->r / mag;
-                    dy *= c->r / mag;
-                }
-                d->kx = f->cx + dx;
-                d->ky = f->cy + dy;
-            } else if (c->kind == XBOX_TOUCH_KIND_DPAD) {
+            if (c->kind == XBOX_TOUCH_KIND_DPAD) {
                 float ux, uy;
-                if (!dpad_dir(c, f->x, f->y, &ux, &uy))
+                dpad_dir(c, f->x, f->y, &ux, &uy);
+                if (ux == 0.0f && uy == 0.0f)
                     d->pressed = 0;
                 d->kx = ux;
                 d->ky = uy;
@@ -591,8 +605,150 @@ int xbox_InputTouchDrawList(xbox_touch_draw *out, int max)
     return n;
 }
 
+/* ── the layout editor ────────────────────────────────────────────── */
+
+static int lay_index(int driving) { return driving != 0; }
+
+int xbox_InputTouchLayoutList(int driving, xbox_touch_draw *out, int max)
+{
+    ctl c[XBOX_TOUCH_MAX_CONTROLS];
+    int n = layout(lay_index(driving), c), k = 0;
+
+    for (int i = 0; i < n && k < max; i++, k++) {
+        xbox_touch_draw *d = &out[k];
+        memset(d, 0, sizeof *d);
+        d->id = c[i].id;
+        d->kind = c[i].kind;
+        d->icon = c[i].icon;
+        d->x = c[i].x;
+        d->y = c[i].y;
+        d->r = c[i].r;
+        d->label = c[i].label;
+        d->rgb = c[i].rgb;
+    }
+    return k;
+}
+
+float xbox_InputTouchLayoutSize(int driving, int id)
+{
+    const struct ovr *o;
+    if (id < 0 || id >= C_COUNT)
+        return 1.0f;
+    o = &g_ovr[lay_index(driving)][id];
+    return o->on ? o->k : 1.0f;
+}
+
+void xbox_InputTouchLayoutMove(int driving, int id, float x, float y, float size)
+{
+    struct ovr *o;
+    if (id < 0 || id >= C_COUNT || g_w <= 0.0f || g_h <= 0.0f)
+        return;
+    o = &g_ovr[lay_index(driving)][id];
+    x /= g_w;
+    y /= g_h;
+    o->on = 1;
+    o->x = x < 0.0f ? 0.0f : x > 1.0f ? 1.0f : x;
+    o->y = y < 0.0f ? 0.0f : y > 1.0f ? 1.0f : y;
+    o->k = size < LAY_SIZE_MIN ? LAY_SIZE_MIN : size > LAY_SIZE_MAX ? LAY_SIZE_MAX : size;
+    g_dirty = 1;
+}
+
+void xbox_InputTouchLayoutReset(int driving)
+{
+    if (driving < 0)
+        memset(g_ovr, 0, sizeof g_ovr);
+    else
+        memset(g_ovr[lay_index(driving)], 0, sizeof g_ovr[0]);
+    g_dirty = 1;
+}
+
+int xbox_InputTouchLayoutText(char *out, int n)
+{
+    int len = 0;
+#define PUT(...) do { int w_ = snprintf(out && len < n ? out + len : NULL, \
+                                        out && len < n ? (size_t)(n - len) : 0, __VA_ARGS__); \
+                      if (w_ > 0) len += w_; } while (0)
+    if (out && n > 0)
+        out[0] = 0;
+    PUT("# Takedawn touch controls: <race|menus> <control> <x> <y> <size>\n"
+        "# x and y: the centre, fractions of the screen; size: times the designed one\n");
+    for (int d = 1; d >= 0; d--)
+        for (int i = 0; i < C_COUNT; i++) {
+            const struct ovr *o = &g_ovr[d][i];
+            if (o->on)
+                PUT("%s %s %.4f %.4f %.2f\n", d ? "race" : "menus", k_name[i], o->x, o->y, o->k);
+        }
+#undef PUT
+    return len;
+}
+
+void xbox_InputTouchLayoutParse(const char *text)
+{
+    memset(g_ovr, 0, sizeof g_ovr);
+    g_dirty = 1;
+    while (text && *text) {
+        char which[16], name[16];
+        float x, y, k;
+        const char *nl = strchr(text, '\n');
+        if (*text != '#' && sscanf(text, "%15s %15s %f %f %f", which, name, &x, &y, &k) == 5) {
+            int d = !strcmp(which, "race") ? 1 : !strcmp(which, "menus") ? 0 : -1;
+            for (int i = 0; d >= 0 && i < C_COUNT; i++)
+                if (!strcmp(name, k_name[i]) && x >= 0.0f && x <= 1.0f && y >= 0.0f && y <= 1.0f) {
+                    g_ovr[d][i].on = 1;
+                    g_ovr[d][i].x = x;
+                    g_ovr[d][i].y = y;
+                    g_ovr[d][i].k = k < LAY_SIZE_MIN ? LAY_SIZE_MIN : k > LAY_SIZE_MAX ? LAY_SIZE_MAX : k;
+                }
+        }
+        text = nl ? nl + 1 : NULL;
+    }
+}
+
+int xbox_InputTouchLayoutLoad(const char *path)
+{
+    char buf[4096];
+    size_t got;
+    FILE *f = path && *path ? fopen(path, "rb") : NULL;
+
+    if (!f) {
+        xbox_InputTouchLayoutReset(-1);
+        return 0;
+    }
+    got = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[got] = 0;
+    xbox_InputTouchLayoutParse(buf);
+    return 1;
+}
+
+int xbox_InputTouchLayoutSave(const char *path)
+{
+    char buf[4096], tmp[1100];
+    int len = xbox_InputTouchLayoutText(buf, sizeof buf);
+    FILE *f;
+
+    if (!path || !*path || len >= (int)sizeof buf
+            || snprintf(tmp, sizeof tmp, "%s.tmp", path) >= (int)sizeof tmp)
+        return 0;
+    f = fopen(tmp, "wb");
+    if (!f)
+        return 0;
+    if (fwrite(buf, 1, (size_t)len, f) != (size_t)len) {
+        fclose(f);
+        remove(tmp);
+        return 0;
+    }
+    if (fclose(f) != 0) {
+        remove(tmp);
+        return 0;
+    }
+    remove(path);                       /* Windows' rename does not replace */
+    return rename(tmp, path) == 0;
+}
+
 void xbox_InputTouchReset(void)
 {
+    memset(g_ovr, 0, sizeof g_ovr);
     memset(g_f, 0, sizeof g_f);
     g_n = 0;
     g_driving = -1;

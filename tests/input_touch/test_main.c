@@ -41,6 +41,7 @@ static int find(const char *label, xbox_touch_draw *out)
 {
     xbox_touch_draw d[XBOX_TOUCH_MAX_CONTROLS];
     int n = xbox_InputTouchDrawList(d, XBOX_TOUCH_MAX_CONTROLS);
+    /* label NULL: the d-pad (the menus' or the steering one). */
     for (int i = 0; i < n; i++) {
         if ((label && d[i].label && !strcmp(d[i].label, label))
                 || (!label && d[i].kind == XBOX_TOUCH_KIND_DPAD)) {
@@ -140,21 +141,45 @@ int main(void)
     CHECK(xbox_InputTouchTakeMenu());
     CHECK(!xbox_InputTouchTakeMenu());
 
-    /* Driving: the stick floats; GAS with it; BOOST is A with the gas. */
+    /* Driving: a steering d-pad that stays put; GAS with it; BOOST is A
+     * with the gas. */
     setup();
     g_driving = 1;
     CHECK(find("GAS", &c));
     CHECK(!find("A", &c));
-    xbox_InputTouchFinger(XBOX_TOUCH_DOWN, 10, 500, 700);    /* left half: the stick */
-    xbox_InputTouchFinger(XBOX_TOUCH_MOVE, 10, 500 + 1080 * 0.15f, 700);  /* full right */
+    {
+        xbox_touch_draw st;
+        CHECK(find(NULL, &st));
+        CHECK(st.x < 1920 * 0.3f && st.y > 1080 * 0.4f);         /* left, low */
+        /* Lands right of the centre: right at once (no centre that
+         * follows the thumb), with no d-pad button. */
+        xbox_InputTouchFinger(XBOX_TOUCH_DOWN, 10, st.x + st.r * 0.6f, st.y);
+        g = read0(&rc, &src);
+        CHECK(g.sThumbLX == 32767 && g.sThumbLY == 0 && g.wButtons == 0);
+        /* Slid across: full left. */
+        xbox_InputTouchFinger(XBOX_TOUCH_MOVE, 10, st.x - st.r * 0.6f, st.y + st.r * 0.2f);
+        g = read0(&rc, &src);
+        CHECK(g.sThumbLX == -32767 && g.sThumbLY == 0);
+        /* Off the d-pad, still left. */
+        xbox_InputTouchFinger(XBOX_TOUCH_MOVE, 10, st.x - st.r * 2.0f, st.y);
+        g = read0(&rc, &src);
+        CHECK(g.sThumbLX == -32767);
+        /* A diagonal: left and up, both whole (the aftertouch). */
+        xbox_InputTouchFinger(XBOX_TOUCH_MOVE, 10, st.x - st.r * 0.5f, st.y - st.r * 0.5f);
+        g = read0(&rc, &src);
+        CHECK(g.sThumbLX == -32767 && g.sThumbLY == 32767);
+        CHECK(find(NULL, &st) && st.pressed && st.kx == -1.0f && st.ky == -1.0f);
+        /* The centre: nothing. */
+        xbox_InputTouchFinger(XBOX_TOUCH_MOVE, 10, st.x, st.y);
+        g = read0(&rc, &src);
+        CHECK(g.sThumbLX == 0 && g.sThumbLY == 0);
+        xbox_InputTouchFinger(XBOX_TOUCH_MOVE, 10, st.x + st.r, st.y);   /* right again */
+    }
     find("GAS", &c);
     xbox_InputTouchFinger(XBOX_TOUCH_DOWN, 11, c.x, c.y);
     g = read0(&rc, &src);
-    CHECK(g.sThumbLX > 32000 && g.sThumbLY == 0);
+    CHECK(g.sThumbLX == 32767 && g.sThumbLY == 0);
     CHECK(g.bAnalogButtons[XBOX_BUTTON_RTRIGGER] == 255 && g.bAnalogButtons[XBOX_BUTTON_A] == 0);
-    xbox_InputTouchFinger(XBOX_TOUCH_MOVE, 10, 500 - 1080 * 0.05f, 700);  /* a third left */
-    g = read0(&rc, &src);
-    CHECK(g.sThumbLX < -8000 && g.sThumbLX > -14000);
     /* Glide from GAS to BOOST. */
     find("BOOST", &c);
     xbox_InputTouchFinger(XBOX_TOUCH_MOVE, 11, c.x, c.y);
@@ -261,8 +286,6 @@ int main(void)
         for (int i = 0; i < n; i++) {
             const float x0 = d[i].x - d[i].r, x1 = d[i].x + d[i].r;
             const float y0 = d[i].y - d[i].r, y1 = d[i].y + d[i].r;
-            if (d[i].kind == XBOX_TOUCH_KIND_STICK)
-                continue;               /* floats; its rest is checked below */
             CHECK(!(y1 > h * 0.855f && x1 > w - h * 0.37f));
             CHECK(!(y0 < h * 0.19f && (x0 < h * 0.22f || x1 > w - h * 0.22f)));
             CHECK(!(y0 < h * 0.16f && x1 > w * 0.5f - h * 0.205f && x0 < w * 0.5f + h * 0.205f));
@@ -286,6 +309,73 @@ int main(void)
         xbox_InputTouchSetDpi(440);
         find("GAS", &g1);
         CHECK(g1.r == g0.r && g1.x == g0.x);
+    }
+
+    /* The layout editor: a control moved and resized is where the fingers
+     * find it, the other layout is not touched, the text comes back the
+     * same, and a reset is the design again. */
+    {
+        xbox_touch_draw gas0, gas1, a0, a1, l[XBOX_TOUCH_MAX_CONTROLS];
+        char text[4096], again[4096];
+        const char *path = "input_touch_layout.txt";
+        int n, id = -1;
+
+        setup();
+        g_driving = 1;
+        find("GAS", &gas0);
+        g_driving = 0;
+        find("A", &a0);
+        g_driving = 1;
+        n = xbox_InputTouchLayoutList(1, l, XBOX_TOUCH_MAX_CONTROLS);
+        for (int i = 0; i < n; i++)
+            if (l[i].label && !strcmp(l[i].label, "GAS"))
+                id = l[i].id;
+        CHECK(id >= 0 && xbox_InputTouchLayoutSize(1, id) == 1.0f);
+        xbox_InputTouchLayoutMove(1, id, 960, 540, 1.5f);
+        CHECK(find("GAS", &gas1));
+        CHECK(gas1.x == 960 && gas1.y == 540 && gas1.r > gas0.r * 1.49f && gas1.r < gas0.r * 1.51f);
+        xbox_InputTouchFinger(XBOX_TOUCH_DOWN, 30, 960 + gas1.r * 0.9f, 540);
+        g = read0(&rc, &src);
+        CHECK(g.bAnalogButtons[XBOX_BUTTON_RTRIGGER] == 255);
+        xbox_InputTouchFinger(XBOX_TOUCH_UP, 30, 0, 0);
+        read0(&rc, &src);
+        read0(&rc, &src);
+        g_driving = 0;
+        find("A", &a1);
+        CHECK(a1.x == a0.x && a1.y == a0.y);
+        /* Kept on the screen. */
+        xbox_InputTouchLayoutMove(0, a1.id, -500, 99999, 1.0f);
+        find("A", &a1);
+        CHECK(a1.x == a1.r && a1.y == 1080 - a1.r);
+        /* Text, parse, file. */
+        n = xbox_InputTouchLayoutText(text, sizeof text);
+        CHECK(n > 0 && strstr(text, "race gas 0.5000 0.5000 1.50") && strstr(text, "menus a "));
+        xbox_InputTouchLayoutReset(-1);
+        g_driving = 1;
+        find("GAS", &gas1);
+        CHECK(gas1.x == gas0.x && gas1.y == gas0.y && gas1.r == gas0.r);
+        xbox_InputTouchLayoutParse(text);
+        xbox_InputTouchLayoutText(again, sizeof again);
+        CHECK(!strcmp(text, again));
+        CHECK(xbox_InputTouchLayoutSave(path));
+        xbox_InputTouchLayoutReset(1);                 /* the race layout only */
+        find("GAS", &gas1);
+        CHECK(gas1.x == gas0.x);
+        g_driving = 0;
+        find("A", &a1);
+        CHECK(a1.x != a0.x);
+        CHECK(xbox_InputTouchLayoutLoad(path));
+        xbox_InputTouchLayoutText(again, sizeof again);
+        CHECK(!strcmp(text, again));
+        remove(path);
+        CHECK(!xbox_InputTouchLayoutLoad(path));       /* no file: as designed */
+        xbox_InputTouchLayoutText(again, sizeof again);
+        CHECK(!strstr(again, "race gas") && !strstr(again, "menus a "));
+        /* A bad line is skipped, a good one kept. */
+        xbox_InputTouchLayoutParse("race gas 2 0.5 1\nrace nothing 0.5 0.5 1\nmenus b 0.25 0.75 9\n");
+        CHECK(xbox_InputTouchLayoutSize(1, id) == 1.0f);
+        find("B", &a1);
+        CHECK(a1.x == 480 && a1.y == 810);
     }
 
     xbox_InputSetBackend(NULL);
